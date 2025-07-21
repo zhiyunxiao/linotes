@@ -354,6 +354,7 @@ static inline unsigned int fns(unsigned long word, unsigned int n)
 
 #ifdef __KERNEL__
 
+// old__ & ~mask__表示非mask段的全部保留原样，| bits__表示要设置的段的部分，全部使用新值
 #ifndef set_mask_bits
 #define set_mask_bits(ptr, mask, bits)	\
 ({								\
