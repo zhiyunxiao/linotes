@@ -389,6 +389,7 @@ static void lru_gen_inc_refs(struct folio *folio)
 
 	/* see the comment on LRU_REFS_FLAGS */
 	if (!folio_test_referenced(folio)) {
+		// 设置PG_referenced标记位
 		set_mask_bits(&folio->flags, LRU_REFS_MASK, BIT(PG_referenced));
 		return;
 	}
@@ -410,13 +411,16 @@ static bool lru_gen_clear_refs(struct folio *folio)
 	int gen = folio_lru_gen(folio);
 	int type = folio_is_file_lru(folio);
 
+	// 还未开始
 	if (gen < 0)
 		return true;
 
+	// 标记为清零
 	set_mask_bits(&folio->flags, LRU_REFS_FLAGS | BIT(PG_workingset), 0);
 
 	lrugen = &folio_lruvec(folio)->lrugen;
 	/* whether can do without shuffling under the LRU lock */
+	// 是否可以在 LRU 锁下不进行 shuffle / 随即页面分配？
 	return gen == lru_gen_from_seq(READ_ONCE(lrugen->min_seq[type]));
 }
 

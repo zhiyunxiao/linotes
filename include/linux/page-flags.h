@@ -100,7 +100,7 @@ enum pageflags {
 	PG_head,		/* Must be in bit 6 */
 	PG_waiters,		/* Page has waiters, check its waitqueue. Must be bit #7 and in the same byte as "PG_locked" */
 	PG_active,
-	PG_workingset,
+	PG_workingset,	// 页面属于工作集，就是在一定时间范围内被频繁访问的页面
 	PG_owner_priv_1,	/* Owner use. If pagecache, fs may use */
 	PG_owner_2,		/* Owner use. If pagecache, fs may use */
 	PG_arch_1,
