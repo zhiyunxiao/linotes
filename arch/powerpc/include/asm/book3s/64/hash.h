@@ -133,6 +133,7 @@ static inline int get_region_id(unsigned long ea)
 	return region_id;
 }
 
+// 该函数检查两个 PMD 条目在排除特定标志后是否相同，用于优化内核页表管理中的哈希操作。
 static inline int hash__pmd_same(pmd_t pmd_a, pmd_t pmd_b)
 {
 	return (((pmd_raw(pmd_a) ^ pmd_raw(pmd_b)) & ~cpu_to_be64(_PAGE_HPTEFLAGS)) == 0);
