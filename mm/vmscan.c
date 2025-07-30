@@ -917,15 +917,17 @@ static enum folio_references folio_check_references(struct folio *folio,
 	int referenced_ptes, referenced_folio;
 	unsigned long vm_flags;
 
-	referenced_ptes = folio_referenced(folio, 1, sc->target_mem_cgroup,
+	/* 步骤1：获取反向映射统计 */
+	referenced_ptes = folio_referenced(folio, 1, sc->target_mem_cgroup,   // PTE级访问次数
 					   &vm_flags);
 
 	/*
 	 * The supposedly reclaimable folio was found to be in a VM_LOCKED vma.
 	 * Let the folio, now marked Mlocked, be moved to the unevictable list.
 	 */
+	/* 步骤2：处理锁定的内存页 */
 	if (vm_flags & VM_LOCKED)
-		return FOLIOREF_ACTIVATE;
+		return FOLIOREF_ACTIVATE;  // 激活锁定页
 
 	/*
 	 * There are two cases to consider.
@@ -933,19 +935,23 @@ static enum folio_references folio_check_references(struct folio *folio,
 	 * 2) Skip the non-shared swapbacked folio mapped solely by
 	 *    the exiting or OOM-reaped process.
 	 */
-	if (referenced_ptes == -1)
-		return FOLIOREF_KEEP;
+	/* 步骤3：处理锁争用或特殊僵尸页 */
+	if (referenced_ptes == -1)     // 竞争或僵尸页
+		return FOLIOREF_KEEP;      // 保留不处理
 
+	/* 步骤4：多代LRU处理 */
 	if (lru_gen_enabled()) {
-		if (!referenced_ptes)
+		if (!referenced_ptes)      // 无访问
 			return FOLIOREF_RECLAIM;
 
+		// 有访问则用新型策略
 		return lru_gen_set_refs(folio) ? FOLIOREF_ACTIVATE : FOLIOREF_KEEP;
 	}
 
-	referenced_folio = folio_test_clear_referenced(folio);
+	/* 步骤5：传统回收决策 */
+	referenced_folio = folio_test_clear_referenced(folio); // 读取PG_referenced位
 
-	if (referenced_ptes) {
+	if (referenced_ptes) {         // 有PTE级访问
 		/*
 		 * All mapped folios start out with page table
 		 * references from the instantiating fault, so we need
@@ -960,25 +966,28 @@ static enum folio_references folio_check_references(struct folio *folio,
 		 * so that recently deactivated but used folios are
 		 * quickly recovered.
 		 */
-		folio_set_referenced(folio);
+		folio_set_referenced(folio); // 标记页面为被引用
 
+		// 复合热点条件
 		if (referenced_folio || referenced_ptes > 1)
 			return FOLIOREF_ACTIVATE;
 
 		/*
 		 * Activate file-backed executable folios after first usage.
 		 */
+		// 特殊处理可执行文件页
 		if ((vm_flags & VM_EXEC) && folio_is_file_lru(folio))
 			return FOLIOREF_ACTIVATE;
 
-		return FOLIOREF_KEEP;
+		return FOLIOREF_KEEP;      // 单次引用暂缓回收
 	}
 
 	/* Reclaim if clean, defer dirty folios to writeback */
+	/* 步骤6：无访问的页面处理 */
 	if (referenced_folio && folio_is_file_lru(folio))
-		return FOLIOREF_RECLAIM_CLEAN;
+		return FOLIOREF_RECLAIM_CLEAN; // 干净文件页优先回收
 
-	return FOLIOREF_RECLAIM;
+	return FOLIOREF_RECLAIM;       // 其余情况直接回收
 }
 
 /* Check if a folio is dirty or under writeback */
@@ -3279,28 +3288,35 @@ static int folio_update_gen(struct folio *folio, int gen)
 /* protect pages accessed multiple times through file descriptors */
 static int folio_inc_gen(struct lruvec *lruvec, struct folio *folio, bool reclaiming)
 {
-	int type = folio_is_file_lru(folio);
+	int type = folio_is_file_lru(folio);          // 0=匿名页,1=文件页
 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
-	int new_gen, old_gen = lru_gen_from_seq(lrugen->min_seq[type]);
-	unsigned long new_flags, old_flags = READ_ONCE(folio->flags);
+	int new_gen, old_gen = lru_gen_from_seq(lrugen->min_seq[type]); // 计算旧代索引
+	unsigned long new_flags, old_flags = READ_ONCE(folio->flags); // 原子读取页面标志
 
+	// 确保页面已经有有效的代信息
 	VM_WARN_ON_ONCE_FOLIO(!(old_flags & LRU_GEN_MASK), folio);
 
 	do {
+		// 从页面标志中提取当前代
 		new_gen = ((old_flags & LRU_GEN_MASK) >> LRU_GEN_PGOFF) - 1;
 		/* folio_update_gen() has promoted this page? */
+		// 如果其他线程已更新页面代，直接返回新代
 		if (new_gen >= 0 && new_gen != old_gen)
 			return new_gen;
 
+		// 计算新代：(旧代+1) % 最大代数
 		new_gen = (old_gen + 1) % MAX_NR_GENS;
 
+		// 准备新标志位：清除旧代和引用标志
 		new_flags = old_flags & ~(LRU_GEN_MASK | LRU_REFS_FLAGS);
-		new_flags |= (new_gen + 1UL) << LRU_GEN_PGOFF;
+		new_flags |= (new_gen + 1UL) << LRU_GEN_PGOFF;  // 设置新代标志,gen从0开始，flag从1开始？
 		/* for folio_end_writeback() */
+		// 回收中标记：设置PG_reclaim标志
 		if (reclaiming)
 			new_flags |= BIT(PG_reclaim);
-	} while (!try_cmpxchg(&folio->flags, &old_flags, new_flags));
+	} while (!try_cmpxchg(&folio->flags, &old_flags, new_flags)); // 原子比较交换
 
+	// 更新LRU链表中页面大小统计
 	lru_gen_update_size(lruvec, folio, old_gen, new_gen);
 
 	return new_gen;
@@ -3873,16 +3889,18 @@ static void clear_mm_walk(void)
 static bool inc_min_seq(struct lruvec *lruvec, int type, int swappiness)
 {
 	int zone;
-	int remaining = MAX_LRU_BATCH;
+	int remaining = MAX_LRU_BATCH; // 批量处理控制 (通常=256)
 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
-	int hist = lru_hist_from_seq(lrugen->min_seq[type]);
-	int new_gen, old_gen = lru_gen_from_seq(lrugen->min_seq[type]);
+	int hist = lru_hist_from_seq(lrugen->min_seq[type]); // 历史索引
+	int new_gen, old_gen = lru_gen_from_seq(lrugen->min_seq[type]); // 当前代索引
 
 	/* For file type, skip the check if swappiness is anon only */
+	/* 文件页且只交换匿名页时跳过 */
 	if (type && (swappiness == SWAPPINESS_ANON_ONLY))
 		goto done;
 
 	/* For anon type, skip the check if swappiness is zero (file only) */
+	/* 匿名页且禁止交换时跳过 */
 	if (!type && !swappiness)
 		goto done;
 
@@ -3900,10 +3918,15 @@ static bool inc_min_seq(struct lruvec *lruvec, int type, int swappiness)
 			VM_WARN_ON_ONCE_FOLIO(folio_is_file_lru(folio) != type, folio);
 			VM_WARN_ON_ONCE_FOLIO(folio_zonenum(folio) != zone, folio);
 
+			// 提升页面代（不处于回收上下文中）
 			new_gen = folio_inc_gen(lruvec, folio, false);
+			// 移动到新代链表尾部
 			list_move_tail(&folio->lru, &lrugen->folios[new_gen][type][zone]);
 
 			/* don't count the workingset being lazily promoted */
+			 // 处理非初始状态页面（有引用历史）
+			// refs = ((flags & LRU_REFS_MASK) >> LRU_REFS_PGOFF) + 1，也就是refs对应的标记位处的值+1
+			// BIT(LRU_REFS_WIDTH) = 1 << 2，两者想等时，表示flags在LRU_REFS_MASK处全是1，不想等，则只要REFS不全为1即可
 			if (refs + workingset != BIT(LRU_REFS_WIDTH) + 1) {
 				int tier = lru_tier_from_refs(refs, workingset);
 				int delta = folio_nr_pages(folio);
@@ -4660,18 +4683,28 @@ static int get_type_to_scan(struct lruvec *lruvec, int swappiness)
 {
 	struct ctrl_pos sp, pv;
 
+	// 边界情况1：完全避免swap
 	if (swappiness <= MIN_SWAPPINESS + 1)
 		return LRU_GEN_FILE;
 
+	// 边界情况2：积极使用swap
 	if (swappiness >= MAX_SWAPPINESS)
 		return LRU_GEN_ANON;
 	/*
 	 * Compare the sum of all tiers of anon with that of file to determine
 	 * which type to scan.
 	 */
+	/*
+     * 比较所有层级的匿名页和文件页的总和，
+     * 以确定要扫描的类型
+     */
+	// 结构体包括 sp/pv->refaulted sp/pv->total
+	// 读取匿名页控制位置（使用实际swappiness作为增益）
 	read_ctrl_pos(lruvec, LRU_GEN_ANON, MAX_NR_TIERS, swappiness, &sp);
+	// 读取文件页控制位置（使用互补值作为增益）
 	read_ctrl_pos(lruvec, LRU_GEN_FILE, MAX_NR_TIERS, MAX_SWAPPINESS - swappiness, &pv);
 
+	// 通过比较决定优先扫描类型
 	return positive_ctrl_err(&sp, &pv);
 }
 

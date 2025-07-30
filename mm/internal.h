@@ -149,6 +149,12 @@ static inline void *folio_raw_mapping(const struct folio *folio)
 {
 	unsigned long mapping = (unsigned long)folio->mapping;
 
+	// mapping的地址，后两位用于标记其他作用，因此要去掉再返回
+	// 对于mapping本身，分为三种情况：
+	// 对于匿名页面，mapping成员指向VMA的anon_vma数据结构
+	// 对于交换高速缓存页面，他的mapping成员指向交换分区的swapper_spaces
+	// 对于文件映射页面，mapping成员指向该文件所属的address_space数据结构。
+	// 对于低2位，bit0表示是否是匿名页面，bit1判断是否为非LRU页面
 	return (void *)(mapping & ~PAGE_MAPPING_FLAGS);
 }
 

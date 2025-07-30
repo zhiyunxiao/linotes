@@ -7810,6 +7810,29 @@ void show_state_filter(unsigned int state_filter)
 		debug_show_all_locks();
 }
 
+
+#define WORKINGSET_SHIFT 1
+#define EVICTION_SHIFT	((BITS_PER_LONG - BITS_PER_XA_VALUE) +	\
+			 WORKINGSET_SHIFT + NODES_SHIFT + \
+			 MEM_CGROUP_ID_SHIFT)
+#define EVICTION_MASK	(~0UL >> EVICTION_SHIFT)
+int zyxtest = 0;
+static void zyx_show(void)
+{
+	if (zyxtest != 0) {
+		return;
+	}
+	zyxtest = 1;
+	printk("---zyx--- SECTIONS_PGOFF %ld SECTIONS_WIDTH %d\n", SECTIONS_PGOFF, SECTIONS_WIDTH);
+	printk("---zyx--- NODES_PGOFF %ld NODES_WIDTH %d\n", NODES_PGOFF, NODES_WIDTH);
+	printk("---zyx--- ZONES_PGOFF %ld ZONES_WIDTH %d\n", ZONES_PGOFF, ZONES_WIDTH);
+	printk("---zyx--- LAST_CPUPID_PGOFF %ld LAST_CPUPID_WIDTH %d\n", LAST_CPUPID_PGOFF, LAST_CPUPID_WIDTH);
+	printk("---zyx--- KASAN_TAG_PGOFF %ld KASAN_TAG_WIDTH %d\n", KASAN_TAG_PGOFF, KASAN_TAG_WIDTH);
+	printk("---zyx--- LRU_GEN_PGOFF %ld LRU_GEN_WIDTH %d\n", LRU_GEN_PGOFF, LRU_GEN_WIDTH);
+	printk("---zyx--- LRU_REFS_PGOFF %ld LRU_REFS_WIDTH %d\n", LRU_REFS_PGOFF, LRU_REFS_WIDTH);
+	printk("---zyx--- EVICTION_MASK >> LRU_REFS_WIDTH %lx\n", EVICTION_MASK >> LRU_REFS_WIDTH);
+}
+
 /**
  * init_idle - set up an idle thread for a given CPU
  * @idle: task in question
@@ -7826,6 +7849,7 @@ void __init init_idle(struct task_struct *idle, int cpu)
 		.flags     = 0,
 	};
 #endif
+	zyx_show();
 	struct rq *rq = cpu_rq(cpu);
 	unsigned long flags;
 

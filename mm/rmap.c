@@ -837,33 +837,36 @@ out:
 }
 
 struct folio_referenced_arg {
-	int mapcount;
-	int referenced;
-	unsigned long vm_flags;
-	struct mem_cgroup *memcg;
+	int mapcount;      // 映射数量（从folio直接获取）
+	int referenced;    // 访问计数器（由回调函数递增）
+	unsigned long vm_flags; // 累积的VMA标志
+	struct mem_cgroup *memcg; // 内存控制组（用于cgroup统计）
 };
 
 /*
  * arg: folio_referenced_arg will be passed
  */
+// 反向映射遍历的核心回调函数，用于统计匿名页的访问次数（referenced count）并处理相关内存管理操作
 static bool folio_referenced_one(struct folio *folio,
 		struct vm_area_struct *vma, unsigned long address, void *arg)
 {
 	struct folio_referenced_arg *pra = arg;
+	/* 1. 初始化反向映射遍历器 */
 	DEFINE_FOLIO_VMA_WALK(pvmw, folio, vma, address, 0);
 	int referenced = 0;
 	unsigned long start = address, ptes = 0;
 
-	while (page_vma_mapped_walk(&pvmw)) {
+	while (page_vma_mapped_walk(&pvmw)) { // 遍历所有映射的PTE/PMD
 		address = pvmw.address;
 
+		/* 2. 处理 VM_LOCKED 页 */
 		if (vma->vm_flags & VM_LOCKED) {
 			if (!folio_test_large(folio) || !pvmw.pte) {
 				/* Restore the mlock which got missed */
-				mlock_vma_folio(folio, vma);
+				mlock_vma_folio(folio, vma); // 重新锁定内存
 				page_vma_mapped_walk_done(&pvmw);
 				pra->vm_flags |= VM_LOCKED;
-				return false; /* To break the loop */
+				return false;  // 终止遍历 /* To break the loop */
 			}
 			/*
 			 * For large folio fully mapped to VMA, will
@@ -876,6 +879,7 @@ static bool folio_referenced_one(struct folio *folio,
 			 * should just count the reference of pages out
 			 * the range of VM_LOCKED vma.
 			 */
+			// 大页部分处理
 			ptes++;
 			pra->mapcount--;
 			continue;
@@ -886,23 +890,25 @@ static bool folio_referenced_one(struct folio *folio,
 		 * the exiting or OOM-reaped process. This avoids redundant
 		 * swap-out followed by an immediate unmap.
 		 */
+		/* 3. 过滤僵尸进程的交换页 */
 		if ((!atomic_read(&vma->vm_mm->mm_users) ||
 		    check_stable_address_space(vma->vm_mm)) &&
 		    folio_test_anon(folio) && folio_test_swapbacked(folio) &&
 		    !folio_maybe_mapped_shared(folio)) {
 			pra->referenced = -1;
 			page_vma_mapped_walk_done(&pvmw);
-			return false;
+			return false; // 特殊标记终止
 		}
 
-		if (lru_gen_enabled() && pvmw.pte) {
+		/* 4. 检测访问位 */
+		if (lru_gen_enabled() && pvmw.pte) {    // 多代LRU
 			if (lru_gen_look_around(&pvmw))
 				referenced++;
-		} else if (pvmw.pte) {
+		} else if (pvmw.pte) {                   // 标准PTE处理
 			if (ptep_clear_flush_young_notify(vma, address,
 						pvmw.pte))
 				referenced++;
-		} else if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE)) {
+		} else if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE)) {             // PMD透明大页
 			if (pmdp_clear_flush_young_notify(vma, address,
 						pvmw.pmd))
 				referenced++;
@@ -911,9 +917,10 @@ static bool folio_referenced_one(struct folio *folio,
 			WARN_ON_ONCE(1);
 		}
 
-		pra->mapcount--;
+		pra->mapcount--; // 递减剩余映射计数
 	}
 
+	/* 5. 大页 VM_LOCKED 最终处理 */
 	if ((vma->vm_flags & VM_LOCKED) &&
 			folio_test_large(folio) &&
 			folio_within_vma(folio, vma)) {
@@ -931,16 +938,18 @@ static bool folio_referenced_one(struct folio *folio,
 		}
 	}
 
+	/* 6. 状态更新与计数 */
 	if (referenced)
-		folio_clear_idle(folio);
+		folio_clear_idle(folio);   	// 清除空闲标记
 	if (folio_test_clear_young(folio))
-		referenced++;
+		referenced++; 				// 处理预取标记
 
 	if (referenced) {
-		pra->referenced++;
-		pra->vm_flags |= vma->vm_flags & ~VM_LOCKED;
+		pra->referenced++;  		// 增加引用计数
+		pra->vm_flags |= vma->vm_flags & ~VM_LOCKED; // 收集VMA标志
 	}
 
+	 // 返回是否需要继续遍历
 	if (!pra->mapcount)
 		return false; /* To break the loop */
 
@@ -983,41 +992,51 @@ static bool invalid_folio_referenced_vma(struct vm_area_struct *vma, void *arg)
  * Return: The number of mappings which referenced the folio. Return -1 if
  * the function bailed out due to rmap lock contention.
  */
+// 检测一个内存页（folio）是否被进程访问过（referenced），并统计其被访问的次数
 int folio_referenced(struct folio *folio, int is_locked,
 		     struct mem_cgroup *memcg, unsigned long *vm_flags)
 {
 	bool we_locked = false;
+	// 初始化参数结构（含映射计数和memcg）
 	struct folio_referenced_arg pra = {
-		.mapcount = folio_mapcount(folio),
+		.mapcount = folio_mapcount(folio), // 获取当前映射数量
 		.memcg = memcg,
 	};
+
+	// 反向映射遍历控制器
 	struct rmap_walk_control rwc = {
-		.rmap_one = folio_referenced_one,
-		.arg = (void *)&pra,
-		.anon_lock = folio_lock_anon_vma_read,
-		.try_lock = true,
-		.invalid_vma = invalid_folio_referenced_vma,
+		.rmap_one = folio_referenced_one,   // 核心回调函数
+		.arg = (void *)&pra,                // 传入参数
+		.anon_lock = folio_lock_anon_vma_read, // 匿名页锁定方法
+		.try_lock = true,                   // 尝试非阻塞获取锁
+		.invalid_vma = invalid_folio_referenced_vma, // VMA校验回调
 	};
 
 	*vm_flags = 0;
+	/* 快速路径：无映射直接返回0 */
 	if (!pra.mapcount)
 		return 0;
 
+	/* 处理特殊映射（如设备映射） */
 	if (!folio_raw_mapping(folio))
 		return 0;
 
+	/* 锁处理逻辑 */
 	if (!is_locked && (!folio_test_anon(folio) || folio_test_ksm(folio))) {
-		we_locked = folio_trylock(folio);
+		we_locked = folio_trylock(folio); // 非阻塞加锁
 		if (!we_locked)
-			return 1;
+			return 1; // 锁竞争时保守返回1（表示可能被访问）
 	}
 
+	/* 遍历所有映射 */
 	rmap_walk(folio, &rwc);
-	*vm_flags = pra.vm_flags;
+	*vm_flags = pra.vm_flags; // 输出VMA标志集合
 
+	/* 清理：释放内部加的锁 */
 	if (we_locked)
 		folio_unlock(folio);
 
+	/* 处理竞争结果 */
 	return rwc.contended ? -1 : pra.referenced;
 }
 
@@ -2810,6 +2829,8 @@ out:
  * Find all the mappings of a folio using the mapping pointer and the vma
  * chains contained in the anon_vma struct it points to.
  */
+// 使用映射指针及其指向的anon_vma结构体中包含的vma链，查找folio的所有映射。
+// 匿名页反向映射的遍历引擎，负责扫描所有引用给定匿名内存页的虚拟内存区域（VMAs）
 static void rmap_walk_anon(struct folio *folio,
 		struct rmap_walk_control *rwc, bool locked)
 {
@@ -2817,36 +2838,46 @@ static void rmap_walk_anon(struct folio *folio,
 	pgoff_t pgoff_start, pgoff_end;
 	struct anon_vma_chain *avc;
 
+	/* 步骤1: 获取匿名页反向映射结构 anon_vma 的锁 */
 	if (locked) {
+		// 调用者已持锁：直接获取anon_vma指针
 		anon_vma = folio_anon_vma(folio);
 		/* anon_vma disappear under us? */
-		VM_BUG_ON_FOLIO(!anon_vma, folio);
+		VM_BUG_ON_FOLIO(!anon_vma, folio); // 调试检查
 	} else {
+		// 内部尝试获取锁
 		anon_vma = rmap_walk_anon_lock(folio, rwc);
 	}
 	if (!anon_vma)
-		return;
+		return; // 无映射时退出
 
+	/* 步骤2: 计算页在映射中的偏移范围 */
 	pgoff_start = folio_pgoff(folio);
 	pgoff_end = pgoff_start + folio_nr_pages(folio) - 1;
+
+	/* 步骤3: 区间树遍历所有关联的VMA */
 	anon_vma_interval_tree_foreach(avc, &anon_vma->rb_root,
 			pgoff_start, pgoff_end) {
 		struct vm_area_struct *vma = avc->vma;
+		// 计算页在VMA中的虚拟地址
 		unsigned long address = vma_address(vma, pgoff_start,
 				folio_nr_pages(folio));
 
-		VM_BUG_ON_VMA(address == -EFAULT, vma);
-		cond_resched();
+		VM_BUG_ON_VMA(address == -EFAULT, vma); // 地址有效性校验
+		cond_resched(); // 主动让出CPU防止占用太久
 
+		/* 步骤4: VMA过滤检查 */
 		if (rwc->invalid_vma && rwc->invalid_vma(vma, rwc->arg))
-			continue;
+			continue; // 跳过无效VMA
 
+		/* 步骤5: 核心回调执行 */
 		if (!rwc->rmap_one(folio, vma, address, rwc->arg))
-			break;
+			break; // 回调返回0时中止遍历
+		/* 步骤6: 完成回调检查 */
 		if (rwc->done && rwc->done(folio))
-			break;
+			break; // 完成回调要求停止遍历
 	}
-
+	/* 步骤7: 清理锁状态 */
 	if (!locked)
 		anon_vma_unlock_read(anon_vma);
 }
@@ -2941,14 +2972,18 @@ static void rmap_walk_file(struct folio *folio,
 			 folio_nr_pages(folio), rwc, locked);
 }
 
+// 反向映射（Reverse Mapping）的核心遍历器，负责遍历一个内存页（folio）的所有虚拟内存映射（VMA）。
 void rmap_walk(struct folio *folio, struct rmap_walk_control *rwc)
 {
+	// // 检查是否为 KSM 合并页
 	if (unlikely(folio_test_ksm(folio)))
-		rmap_walk_ksm(folio, rwc);
+		rmap_walk_ksm(folio, rwc);   // 特殊处理 KSM 页
+	// 检查是否为匿名页
 	else if (folio_test_anon(folio))
-		rmap_walk_anon(folio, rwc, false);
+		rmap_walk_anon(folio, rwc, false);  // 处理匿名页
+	// 默认处理文件页
 	else
-		rmap_walk_file(folio, rwc, false);
+		rmap_walk_file(folio, rwc, false);  // 处理文件页
 }
 
 /* Like rmap_walk, but caller holds relevant rmap lock */

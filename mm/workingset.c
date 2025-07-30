@@ -269,14 +269,21 @@ static bool lru_gen_test_recent(void *shadow, struct lruvec **lruvec,
 	struct mem_cgroup *memcg;
 	struct pglist_data *pgdat;
 
+	// 1. 解包影子条目,页面回收时保存的关键元数据,包括memcg_id、pgdat、token、workingset
 	unpack_shadow(shadow, &memcg_id, &pgdat, token, workingset);
 
+	// 2. 获取内存控制组
 	memcg = mem_cgroup_from_id(memcg_id);
+	// 3. 获取LRU向量
 	*lruvec = mem_cgroup_lruvec(memcg, pgdat);
 
+	// 4. 获取当前最大序列号
 	max_seq = READ_ONCE((*lruvec)->lrugen.max_seq);
+	// 5. 应用掩码处理序列号
 	max_seq &= EVICTION_MASK >> LRU_REFS_WIDTH;
 
+	// 6. 比较序列号差异
+	// abs_diff(a, b)：安全的绝对差值计算（处理回绕）
 	return abs_diff(max_seq, *token >> LRU_REFS_WIDTH) < MAX_NR_GENS;
 }
 
