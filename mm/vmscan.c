@@ -7229,51 +7229,37 @@ static enum zone_type kswapd_highest_zoneidx(pg_data_t *pgdat,
 	return curr_idx == MAX_NR_ZONES ? prev_highest_zoneidx : curr_idx;
 }
 
+//  kswapd（内核内存回收线程）尝试进入睡眠状态的核心逻辑，旨在平衡内存回收效率与 CPU 资源占用
 static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_order,
 				unsigned int highest_zoneidx)
 {
 	long remaining = 0;
 	DEFINE_WAIT(wait);
 
+	// 若线程需冻结（如系统挂起）或显式停止（如 rmmod），直接退出。
 	if (freezing(current) || kthread_should_stop())
 		return;
 
+	// 将线程加入 pgdat->kswapd_wait 等待队列，状态设为可中断睡眠
 	prepare_to_wait(&pgdat->kswapd_wait, &wait, TASK_INTERRUPTIBLE);
 
-	/*
-	 * Try to sleep for a short interval. Note that kcompactd will only be
-	 * woken if it is possible to sleep for a short interval. This is
-	 * deliberate on the assumption that if reclaim cannot keep an
-	 * eligible zone balanced that it's also unlikely that compaction will
-	 * succeed.
-	 */
+	// 检查是否可睡眠（如内存压力已缓解）。
 	if (prepare_kswapd_sleep(pgdat, reclaim_order, highest_zoneidx)) {
-		/*
-		 * Compaction records what page blocks it recently failed to
-		 * isolate pages from and skips them in the future scanning.
-		 * When kswapd is going to sleep, it is reasonable to assume
-		 * that pages and compaction may succeed so reset the cache.
-		 */
+		// 唤醒时清除压缩失败历史记录（reset_isolation_suitable），为后续压缩操作提供新机会。
 		reset_isolation_suitable(pgdat);
 
-		/*
-		 * We have freed the memory, now we should compact it to make
-		 * allocation of the requested order possible.
-		 */
+		// 触发 kcompactd 压缩内存以腾出连续空间（wakeup_kcompactd）。
 		wakeup_kcompactd(pgdat, alloc_order, highest_zoneidx);
 
+		// 通过 schedule_timeout(HZ/10) 休眠 100ms。
 		remaining = schedule_timeout(HZ/10);
 
-		/*
-		 * If woken prematurely then reset kswapd_highest_zoneidx and
-		 * order. The values will either be from a wakeup request or
-		 * the previous request that slept prematurely.
-		 */
-		if (remaining) {
-			WRITE_ONCE(pgdat->kswapd_highest_zoneidx,
+		if (remaining) { // 若提前唤醒
+			WRITE_ONCE(pgdat->kswapd_highest_zoneidx,	// 更新节点最高回收区索引（kswapd_highest_zoneidx）。
 					kswapd_highest_zoneidx(pgdat,
 							highest_zoneidx));
 
+			// 若当前回收需求大于历史记录（kswapd_order < reclaim_order），更新为更大值。
 			if (READ_ONCE(pgdat->kswapd_order) < reclaim_order)
 				WRITE_ONCE(pgdat->kswapd_order, reclaim_order);
 		}
@@ -7282,32 +7268,26 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_o
 		prepare_to_wait(&pgdat->kswapd_wait, &wait, TASK_INTERRUPTIBLE);
 	}
 
-	/*
-	 * After a short sleep, check if it was a premature sleep. If not, then
-	 * go fully to sleep until explicitly woken up.
-	 */
+	// 深度睡眠条件：短时睡眠未被中断（!remaining）且当前仍满足睡眠条件。
 	if (!remaining &&
 	    prepare_kswapd_sleep(pgdat, reclaim_order, highest_zoneidx)) {
 		trace_mm_vmscan_kswapd_sleep(pgdat->node_id);
 
-		/*
-		 * vmstat counters are not perfectly accurate and the estimated
-		 * value for counters such as NR_FREE_PAGES can deviate from the
-		 * true value by nr_online_cpus * threshold. To avoid the zone
-		 * watermarks being breached while under pressure, we reduce the
-		 * per-cpu vmstat threshold while kswapd is awake and restore
-		 * them before going back to sleep.
-		 */
+		// 睡眠前切换至 宽松阈值（calculate_normal_threshold），减少误唤醒。
 		set_pgdat_percpu_threshold(pgdat, calculate_normal_threshold);
 
 		if (!kthread_should_stop())
+			// 调用 schedule() 释放 CPU，直至被唤醒（如内存不足事件）。
 			schedule();
 
+		// 唤醒后恢复 压力阈值（calculate_pressure_threshold），提高内存压力敏感度。
 		set_pgdat_percpu_threshold(pgdat, calculate_pressure_threshold);
 	} else {
 		if (remaining)
+			// 快速命中（短时睡眠中唤醒）：KSWAPD_LOW_WMARK_HIT_QUICKLY。
 			count_vm_event(KSWAPD_LOW_WMARK_HIT_QUICKLY);
 		else
+			// 内存压力已缓解（直接跳过睡眠）：KSWAPD_HIGH_WMARK_HIT_QUICKLY。
 			count_vm_event(KSWAPD_HIGH_WMARK_HIT_QUICKLY);
 	}
 	finish_wait(&pgdat->kswapd_wait, &wait);
@@ -7326,6 +7306,14 @@ static void kswapd_try_to_sleep(pg_data_t *pgdat, int alloc_order, int reclaim_o
  * If there are applications that are active memory-allocators
  * (most normal use), this basically shouldn't matter.
  */
+/*
+	后台页面调出守护进程，作为内核线程从 init 进程启动。
+
+	这基本上会逐步调出页面，以便即使没有其他活动释放内存，我们仍然有一些可用的空闲内存。这对于路由等任务来说是必需的，
+	否则所有活动都可能在异步上下文中进行，无法进行页面调出。
+
+	如果某些应用程序正在使用内存分配器（这是最常见的用途），这基本上不会造成影响。 
+*/
 static int kswapd(void *p)
 {
 	unsigned int alloc_order, reclaim_order;
@@ -7333,66 +7321,57 @@ static int kswapd(void *p)
 	pg_data_t *pgdat = (pg_data_t *)p;
 	struct task_struct *tsk = current;
 
-	/*
-	 * Tell the memory management that we're a "memory allocator",
-	 * and that if we need more memory we should get access to it
-	 * regardless (see "__alloc_pages()"). "kswapd" should
-	 * never get caught in the normal page freeing logic.
-	 *
-	 * (Kswapd normally doesn't need memory anyway, but sometimes
-	 * you need a small amount of memory in order to be able to
-	 * page out something else, and this flag essentially protects
-	 * us from recursively trying to free more memory as we're
-	 * trying to free the first piece of memory in the first place).
-	 */
+	// 赋予 特权内存分配权限，允许在内存紧张时直接分配页面（突破水位线限制），避免递归回收死锁。
 	tsk->flags |= PF_MEMALLOC | PF_KSWAPD;
+	// 允许内核冻结机制在系统挂起时暂停该线程。
 	set_freezable();
 
+	// 初始化回收请求阶数为 0（无高阶分配需求）。
 	WRITE_ONCE(pgdat->kswapd_order, 0);
+	// 取消内存区域优先级限制。
 	WRITE_ONCE(pgdat->kswapd_highest_zoneidx, MAX_NR_ZONES);
+	// 重置 I/O 节流计数器，准备准确跟踪脏页写回状态。
 	atomic_set(&pgdat->nr_writeback_throttled, 0);
 	for ( ; ; ) {
 		bool was_frozen;
 
+		// 读取其他线程设置的 kswapd_order（由内存分配失败触发）。
 		alloc_order = reclaim_order = READ_ONCE(pgdat->kswapd_order);
 		highest_zoneidx = kswapd_highest_zoneidx(pgdat,
 							highest_zoneidx);
 
 kswapd_try_sleep:
+		// 通过 kswapd_try_to_sleep() 进入可控休眠
 		kswapd_try_to_sleep(pgdat, alloc_order, reclaim_order,
 					highest_zoneidx);
 
-		/* Read the new order and highest_zoneidx */
+		// 读取后立即清零状态，表示请求已被接管。
 		alloc_order = READ_ONCE(pgdat->kswapd_order);
 		highest_zoneidx = kswapd_highest_zoneidx(pgdat,
 							highest_zoneidx);
+		// 读取后立即清零状态，表示请求已被接管。
 		WRITE_ONCE(pgdat->kswapd_order, 0);
 		WRITE_ONCE(pgdat->kswapd_highest_zoneidx, MAX_NR_ZONES);
 
+		// 若线程被解冻，跳过本轮回收（防止解冻后立即触发冗余回收）。
 		if (kthread_freezable_should_stop(&was_frozen))
-			break;
+			break; // 跳过解冻后首次回收
 
-		/*
-		 * We can speed up thawing tasks if we don't call balance_pgdat
-		 * after returning from the refrigerator
-		 */
 		if (was_frozen)
 			continue;
 
-		/*
-		 * Reclaim begins at the requested order but if a high-order
-		 * reclaim fails then kswapd falls back to reclaiming for
-		 * order-0. If that happens, kswapd will consider sleeping
-		 * for the order it finished reclaiming at (reclaim_order)
-		 * but kcompactd is woken to compact for the original
-		 * request (alloc_order).
-		 */
-		trace_mm_vmscan_kswapd_wake(pgdat->node_id, highest_zoneidx,
+		trace_mm_vmscan_kswapd_wake(pgdat->node_id, highest_zoneidx, // 记录唤醒事件
 						alloc_order);
+		// 执行核心回收逻辑：
+		// 1. 按 alloc_order 启动高阶内存回收。
+		// 2. 若失败则降级为低阶（最终降至 order-0）回收。
 		reclaim_order = balance_pgdat(pgdat, alloc_order,
 						highest_zoneidx);
+		// 回收结果验证：
+		// 1. 成功（reclaim_order >= alloc_order）：正常进入下一轮休眠。
+		// 2. 失败（reclaim_order < alloc_order）：跳回休眠检查点（kswapd_try_sleep），重新评估需求。
 		if (reclaim_order < alloc_order)
-			goto kswapd_try_sleep;
+			goto kswapd_try_sleep; // 跳回休眠检查
 	}
 
 	tsk->flags &= ~(PF_MEMALLOC | PF_KSWAPD);
@@ -7500,6 +7479,9 @@ void __meminit kswapd_run(int nid)
 
 	pgdat_kswapd_lock(pgdat);
 	if (!pgdat->kswapd) {
+		// kswapd 回调函数
+		// pgdat 入参
+		// nid node id
 		pgdat->kswapd = kthread_create_on_node(kswapd, pgdat, nid, "kswapd%d", nid);
 		if (IS_ERR(pgdat->kswapd)) {
 			/* failure at boot is fatal */

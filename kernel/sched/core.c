@@ -7831,6 +7831,7 @@ static void zyx_show(void)
 	printk("---zyx--- LRU_GEN_PGOFF %ld LRU_GEN_WIDTH %d\n", LRU_GEN_PGOFF, LRU_GEN_WIDTH);
 	printk("---zyx--- LRU_REFS_PGOFF %ld LRU_REFS_WIDTH %d\n", LRU_REFS_PGOFF, LRU_REFS_WIDTH);
 	printk("---zyx--- EVICTION_MASK >> LRU_REFS_WIDTH %lx\n", EVICTION_MASK >> LRU_REFS_WIDTH);
+	printk("---zyx--- 20250805 14:00:00\n");
 }
 
 /**

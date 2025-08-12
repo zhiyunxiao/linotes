@@ -222,6 +222,7 @@ unlock:
  */
 bool set_freezable(void)
 {
+	// 如果调用点位于禁止睡眠的上下文（如原子上下文），会发出警告
 	might_sleep();
 
 	/*
@@ -229,10 +230,13 @@ bool set_freezable(void)
 	 * freezer notices that we aren't frozen yet or the freezing
 	 * condition is visible to try_to_freeze() below.
 	 */
+	// 防止多个CPU同时修改进程标志位
 	spin_lock_irq(&freezer_lock);
+	// 通过清除当前进程（current）的 PF_NOFREEZE 标志
 	current->flags &= ~PF_NOFREEZE;
 	spin_unlock_irq(&freezer_lock);
 
+	// 调用 try_to_freeze() 检查系统是否需要冻结进程，如果需要，则让当前进程进入冻结状态（放入"冰箱"）
 	return try_to_freeze();
 }
 EXPORT_SYMBOL(set_freezable);
