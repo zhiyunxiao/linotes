@@ -6917,43 +6917,44 @@ static bool prepare_kswapd_sleep(pg_data_t *pgdat, int order,
 }
 
 /*
- * kswapd shrinks a node of pages that are at or below the highest usable
- * zone that is currently unbalanced.
- *
- * Returns true if kswapd scanned at least the requested number of pages to
- * reclaim or if the lack of progress was due to pages under writeback.
- * This is used to determine if the scanning priority needs to be raised.
- */
+	kswapd 会收缩当前不平衡的页面节点，这些页面节点位于最高可用区域或以下。
+
+	如果 kswapd 扫描的页面数量至少达到请求的回收数量，或者由于页面处于回写状态而导致
+	进度缓慢，则返回 true。这用于确定是否需要提高扫描优先级。
+*/
 static bool kswapd_shrink_node(pg_data_t *pgdat,
 			       struct scan_control *sc)
 {
 	struct zone *zone;
 	int z;
-	unsigned long nr_reclaimed = sc->nr_reclaimed;
+	unsigned long nr_reclaimed = sc->nr_reclaimed;  // 记录初始已回收页数
 
-	/* Reclaim a number of pages proportional to the number of zones */
 	sc->nr_to_reclaim = 0;
+	// 遍历需回收的zone（受限于sc->reclaim_idx）
 	for_each_managed_zone_pgdat(zone, pgdat, z, sc->reclaim_idx) {
+		// high_wmark_pages(zone)：该zone的高水位页数
+		// SWAP_CLUSTER_MAX：32（典型值），最小回收单元
+		// 取二者最大值：确保每轮回收足够页面，防止小规模无效回收
 		sc->nr_to_reclaim += max(high_wmark_pages(zone), SWAP_CLUSTER_MAX);
 	}
 
-	/*
-	 * Historically care was taken to put equal pressure on all zones but
-	 * now pressure is applied based on node LRU order.
-	 */
+	// 核心回收执行
 	shrink_node(pgdat, sc);
 
-	/*
-	 * Fragmentation may mean that the system cannot be rebalanced for
-	 * high-order allocations. If twice the allocation size has been
-	 * reclaimed then recheck watermarks only at order-0 to prevent
-	 * excessive reclaim. Assume that a process requested a high-order
-	 * can direct reclaim/compact.
-	 */
+	// 防过度回收机制：
+	// 1. 仅当处理高阶分配时生效（sc->order > 0）
+	// 2. compact_gap()：计算阈值（通常为 2 * (2^order) 页）
+	// 3. 核心逻辑：若回收页数超过碎片阈值
+	//        说明碎片是主要问题而非总内存量
+	//        降阶为 order-0 回收（避免继续无效回收）
+	//        相当于说："回收了双倍所需内存仍无法满足，换策略！"
 	if (sc->order && sc->nr_reclaimed >= compact_gap(sc->order))
 		sc->order = 0;
 
 	/* account for progress from mm_account_reclaimed_pages() */
+	// 回收成效验证
+	// 计算实际回收增量：sc->nr_reclaimed - nr_reclaimed
+	// 与扫描页数(sc->nr_scanned)比较
 	return max(sc->nr_scanned, sc->nr_reclaimed - nr_reclaimed) >= sc->nr_to_reclaim;
 }
 
@@ -6997,191 +6998,157 @@ clear_reclaim_active(pg_data_t *pgdat, int highest_zoneidx)
  * or lower is eligible for reclaim until at least one usable zone is
  * balanced.
  */
+/*
+对于 kswapd，balance_pgdat() 将从调用者可用的区域中回收节点内的页面，直到至少一个可用区域达到平衡。
+
+返回 kswapd 完成回收的顺序。
+
+kswapd 会按 highmem->normal->dma 方向扫描区域。它会跳过 free_pages > high_wmark_pages(zone) 的
+区域，但一旦发现某个区域的 free_pages <= high_wmark_pages(zone)，则该区域或更低区域内的任何页面
+都有资格回收，直到至少一个可用区域达到平衡。
+*/
+// pgdat：指向要平衡的内存节点的指针。
+// order：要求回收的页面数量（2的order次方个页面）。
+// highest_zoneidx：回收可以触及的最高内存区域索引（zone索引，从0开始，数值越小表示内存越稀缺）。
 static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
 {
 	int i;
-	unsigned long nr_soft_reclaimed;
-	unsigned long nr_soft_scanned;
-	unsigned long pflags;
-	unsigned long nr_boost_reclaim;
-	unsigned long zone_boosts[MAX_NR_ZONES] = { 0, };
-	bool boosted;
-	struct zone *zone;
-	struct scan_control sc = {
-		.gfp_mask = GFP_KERNEL,
-		.order = order,
-		.may_unmap = 1,
+	unsigned long nr_soft_reclaimed;    	// 软限制回收的页面数
+	unsigned long nr_soft_scanned;       	// 软限制扫描的页面数
+	unsigned long pflags;                	// 用于psi（压力停滞信息）的标志
+	unsigned long nr_boost_reclaim;      	// 需要回收的boost总量
+	unsigned long zone_boosts[MAX_NR_ZONES] = { 0, }; 	// 每个zone的boost值
+	bool boosted;                        	// 是否发生了boost
+	struct zone *zone;                   	// 遍历时指向当前zone的指针
+	struct scan_control sc = {           	// 扫描控制结构，配置回收行为
+		.gfp_mask = GFP_KERNEL,       		// 使用GFP_KERNEL标志，允许等待
+		.order = order,               		// 传入的order
+		.may_unmap = 1,               		// 允许取消页面映射（即回收匿名页或页面缓存时解除映射）
 	};
 
-	set_task_reclaim_state(current, &sc.reclaim_state);
-	psi_memstall_enter(&pflags);
-	__fs_reclaim_acquire(_THIS_IP_);
+	set_task_reclaim_state(current, &sc.reclaim_state); 	// 设置当前任务的回收状态
+	psi_memstall_enter(&pflags);                        	// 进入内存停滞状态，用于PSI统计
+	__fs_reclaim_acquire(_THIS_IP_);                     	// 禁止文件系统回收（防止递归死锁）
 
-	count_vm_event(PAGEOUTRUN);
+	count_vm_event(PAGEOUTRUN);                          	// 增加VM事件计数：一次页面回收运行
 
-	/*
-	 * Account for the reclaim boost. Note that the zone boost is left in
-	 * place so that parallel allocations that are near the watermark will
-	 * stall or direct reclaim until kswapd is finished.
-	 */
 	nr_boost_reclaim = 0;
+	// watermark_boost：每个zone有一个boost值，当分配失败时可能会提高水位线（watermark）以触发
+	// kswapd更积极地回收。这里记录下当前的boost值，以便在回收完成后降低boost。
 	for_each_managed_zone_pgdat(zone, pgdat, i, highest_zoneidx) {
-		nr_boost_reclaim += zone->watermark_boost;
-		zone_boosts[i] = zone->watermark_boost;
+		nr_boost_reclaim += zone->watermark_boost;   	// 累加所有zone的watermark_boost
+		zone_boosts[i] = zone->watermark_boost;       	// 记录每个zone的boost值
 	}
-	boosted = nr_boost_reclaim;
+	boosted = nr_boost_reclaim;   // 如果 nr_boost_reclaim 大于0，则 boosted 为 true
 
 restart:
-	set_reclaim_active(pgdat, highest_zoneidx);
-	sc.priority = DEF_PRIORITY;
+	set_reclaim_active(pgdat, highest_zoneidx); 		// 设置节点为回收活跃状态
+	sc.priority = DEF_PRIORITY;                 		// 初始化扫描优先级为默认值（12）
 	do {
-		unsigned long nr_reclaimed = sc.nr_reclaimed;
-		bool raise_priority = true;
+		unsigned long nr_reclaimed = sc.nr_reclaimed; 	// 记录本轮循环开始时已回收的页面数
+		bool raise_priority = true;                  	// 默认下一轮需要提高优先级（即降低优先级数值）
 		bool balanced;
 		bool ret;
 		bool was_frozen;
 
-		sc.reclaim_idx = highest_zoneidx;
+		sc.reclaim_idx = highest_zoneidx;           	// 设置扫描控制中的回收索引为最高zone索引
 
-		/*
-		 * If the number of buffer_heads exceeds the maximum allowed
-		 * then consider reclaiming from all zones. This has a dual
-		 * purpose -- on 64-bit systems it is expected that
-		 * buffer_heads are stripped during active rotation. On 32-bit
-		 * systems, highmem pages can pin lowmem memory and shrinking
-		 * buffers can relieve lowmem pressure. Reclaim may still not
-		 * go ahead if all eligible zones for the original allocation
-		 * request are balanced to avoid excessive reclaim from kswapd.
-		 */
+		// 当系统中有过多的buffer_heads（通常发生在32位系统上，高端内存映射占用低端内存）时，需要回收所有zone（包括高zone）来释放buffer_heads。
 		if (buffer_heads_over_limit) {
 			for (i = MAX_NR_ZONES - 1; i >= 0; i--) {
 				zone = pgdat->node_zones + i;
 				if (!managed_zone(zone))
 					continue;
 
-				sc.reclaim_idx = i;
+				sc.reclaim_idx = i;   // 强制回收所有zone，包括高zone（通常是高端内存）
 				break;
 			}
 		}
 
-		/*
-		 * If the pgdat is imbalanced then ignore boosting and preserve
-		 * the watermarks for a later time and restart. Note that the
-		 * zone watermarks will be still reset at the end of balancing
-		 * on the grounds that the normal reclaim should be enough to
-		 * re-evaluate if boosting is required when kswapd next wakes.
-		 */
-		balanced = pgdat_balanced(pgdat, sc.order, highest_zoneidx);
+		// 如果节点不平衡（即有zone的水位线不满足要求）并且之前有boost，那么放弃boost（因为boost可能打破了平衡），然后重新开始。
+		balanced = pgdat_balanced(pgdat, sc.order, highest_zoneidx); // 检查节点是否已平衡（即所有可达zone的水位线满足要求）
 		if (!balanced && nr_boost_reclaim) {
-			nr_boost_reclaim = 0;
-			goto restart;
+			nr_boost_reclaim = 0;  // 重置boost_reclaim计数
+			goto restart;           // 重新开始，因为boost可能导致不平衡，现在取消boost并重试
 		}
 
-		/*
-		 * If boosting is not active then only reclaim if there are no
-		 * eligible zones. Note that sc.reclaim_idx is not used as
-		 * buffer_heads_over_limit may have adjusted it.
-		 */
 		if (!nr_boost_reclaim && balanced)
-			goto out;
+			goto out;   // 不需要回收，退出
 
-		/* Limit the priority of boosting to avoid reclaim writeback */
 		if (nr_boost_reclaim && sc.priority == DEF_PRIORITY - 2)
-			raise_priority = false;
+			raise_priority = false;   // 如果已经提高到较高优先级（数值为10），则不再提高（避免写回过多）
 
-		/*
-		 * Do not writeback or swap pages for boosted reclaim. The
-		 * intent is to relieve pressure not issue sub-optimal IO
-		 * from reclaim context. If no pages are reclaimed, the
-		 * reclaim will be aborted.
-		 */
-		sc.may_writepage = !laptop_mode && !nr_boost_reclaim;
-		sc.may_swap = !nr_boost_reclaim;
+		// boost回收的目标是快速释放少量内存（通常为了满足高阶分配），因此禁止写回和交换（因为它们慢且可能不是必要的）。
+		sc.may_writepage = !laptop_mode && !nr_boost_reclaim; // 允许写页面，除非是笔记本模式或处于boost回收
+		sc.may_swap = !nr_boost_reclaim; // 允许交换，除非处于boost回收
 
-		/*
-		 * Do some background aging, to give pages a chance to be
-		 * referenced before reclaiming. All pages are rotated
-		 * regardless of classzone as this is about consistent aging.
-		 */
-		kswapd_age_node(pgdat, &sc);
+		// 通过扫描活动列表，将一段时间未被访问的页面标记为不活跃，以便后续回收。
+		kswapd_age_node(pgdat, &sc);  // 对节点的页面进行老化（将不活跃页面移动到不活跃列表的尾部）
 
-		/*
-		 * If we're getting trouble reclaiming, start doing writepage
-		 * even in laptop mode.
-		 */
-		if (sc.priority < DEF_PRIORITY - 2)
-			sc.may_writepage = 1;
+		// 在低优先级时强制允许写回
+		if (sc.priority < DEF_PRIORITY - 2) // 如果优先级提高到比较高的程度（数值小于10）
+			sc.may_writepage = 1;      // 强制允许写回，因为回收困难
 
-		/* Call soft limit reclaim before calling shrink_node. */
-		sc.nr_scanned = 0;
+		// 软限制回收
+		sc.nr_scanned = 0;   // 重置扫描计数
 		nr_soft_scanned = 0;
 		nr_soft_reclaimed = memcg1_soft_limit_reclaim(pgdat, sc.order,
 							      sc.gfp_mask, &nr_soft_scanned);
-		sc.nr_reclaimed += nr_soft_reclaimed;
+		sc.nr_reclaimed += nr_soft_reclaimed;  // 累加软限制回收的页面数
 
-		/*
-		 * There should be no need to raise the scanning priority if
-		 * enough pages are already being scanned that that high
-		 * watermark would be met at 100% efficiency.
-		 */
-		if (kswapd_shrink_node(pgdat, &sc))
-			raise_priority = false;
+		// 收缩节点
+		// kswapd_shrink_node 是核心回收函数，它遍历节点的zone并回收页面。
+		// 如果它返回true，表示已经回收到足够多的页面，因此不需要在下一轮
+		// 提高优先级（即保持当前优先级继续回收）。
+		if (kswapd_shrink_node(pgdat, &sc)) // 执行实际的回收工作
+			raise_priority = false;    // 如果回收足够有效，则不需要提高优先级
 
-		/*
-		 * If the low watermark is met there is no need for processes
-		 * to be throttled on pfmemalloc_wait as they should not be
-		 * able to safely make forward progress. Wake them
-		 */
+		// 当节点满足低水线时，允许直接回收（由进程自身执行回收），因此唤醒等待的进程
+		// （通常是网络进程，因pfmemalloc而阻塞）。
 		if (waitqueue_active(&pgdat->pfmemalloc_wait) &&
 				allow_direct_reclaim(pgdat))
-			wake_up_all(&pgdat->pfmemalloc_wait);
+			wake_up_all(&pgdat->pfmemalloc_wait); // 如果允许直接回收，唤醒等待的进程
 
-		/* Check if kswapd should be suspending */
-		__fs_reclaim_release(_THIS_IP_);
-		ret = kthread_freezable_should_stop(&was_frozen);
-		__fs_reclaim_acquire(_THIS_IP_);
-		if (was_frozen || ret)
+		// 检查是否应该停止（冻结或终止）
+		__fs_reclaim_release(_THIS_IP_);  // 临时释放FS回收锁，允许进行冻结操作
+		ret = kthread_freezable_should_stop(&was_frozen); // 检查线程是否被冻结或需要停止
+		__fs_reclaim_acquire(_THIS_IP_);   // 重新获取FS回收锁
+		if (was_frozen || ret)           // 如果被冻结或需要停止，则跳出循环
 			break;
 
-		/*
-		 * Raise priority if scanning rate is too low or there was no
-		 * progress in reclaiming pages
-		 */
-		nr_reclaimed = sc.nr_reclaimed - nr_reclaimed;
-		nr_boost_reclaim -= min(nr_boost_reclaim, nr_reclaimed);
+		// 调整优先级和boost计数
+		nr_reclaimed = sc.nr_reclaimed - nr_reclaimed; // 计算本轮循环回收的页面数
+		nr_boost_reclaim -= min(nr_boost_reclaim, nr_reclaimed); // 减少待回收的boost页面数
 
-		/*
-		 * If reclaim made no progress for a boost, stop reclaim as
-		 * IO cannot be queued and it could be an infinite loop in
-		 * extreme circumstances.
-		 */
+		// 如果本次回收没有回收到页面且nr_boost_reclaim>0，则跳出循环（避免死循环）
 		if (nr_boost_reclaim && !nr_reclaimed)
 			break;
-
+		
+		// 如果需要提高优先级或者本轮没有回收页面，则提高优先级（降低优先级数值）
 		if (raise_priority || !nr_reclaimed)
 			sc.priority--;
-	} while (sc.priority >= 1);
+	} while (sc.priority >= 1);  // 当优先级大于等于1（即优先级数值从12降到1）时继续循环
 
-	/*
-	 * Restart only if it went through the priority loop all the way,
-	 * but cache_trim_mode didn't work.
-	 */
+	// 如果整个优先级循环都执行完了（优先级降到1以下）但没有回收到页面，
+	// 并且是因为cache_trim_mode失败，则重试一次（关闭cache_trim_mode）
 	if (!sc.nr_reclaimed && sc.priority < 1 &&
 	    !sc.no_cache_trim_mode && sc.cache_trim_mode_failed) {
-		sc.no_cache_trim_mode = 1;
+		sc.no_cache_trim_mode = 1;  // 标记不再尝试cache_trim_mode
 		goto restart;
 	}
 
+	// 如果整个回收过程中没有回收任何页面，增加失败计数
 	if (!sc.nr_reclaimed)
 		pgdat->kswapd_failures++;
 
 out:
-	clear_reclaim_active(pgdat, highest_zoneidx);
+	clear_reclaim_active(pgdat, highest_zoneidx); // 清除节点的回收活跃状态
 
-	/* If reclaim was boosted, account for the reclaim done in this pass */
+	// 处理boost回收后的清理
 	if (boosted) {
 		unsigned long flags;
 
+		// 遍历所有zone，减去本次回收中使用的boost值
 		for (i = 0; i <= highest_zoneidx; i++) {
 			if (!zone_boosts[i])
 				continue;
@@ -7189,29 +7156,23 @@ out:
 			/* Increments are under the zone lock */
 			zone = pgdat->node_zones + i;
 			spin_lock_irqsave(&zone->lock, flags);
-			zone->watermark_boost -= min(zone->watermark_boost, zone_boosts[i]);
+			zone->watermark_boost -= min(zone->watermark_boost, zone_boosts[i]); // 减去本次使用的boost值
 			spin_unlock_irqrestore(&zone->lock, flags);
 		}
 
-		/*
-		 * As there is now likely space, wakeup kcompact to defragment
-		 * pageblocks.
-		 */
+		// 因为通过回收释放了空间，唤醒kcompactd进行内存碎片整理
 		wakeup_kcompactd(pgdat, pageblock_order, highest_zoneidx);
 	}
 
-	snapshot_refaults(NULL, pgdat);
-	__fs_reclaim_release(_THIS_IP_);
-	psi_memstall_leave(&pflags);
-	set_task_reclaim_state(current, NULL);
+	snapshot_refaults(NULL, pgdat);   // 记录refault（重新进入）的页面数，用于工作集检测
+	__fs_reclaim_release(_THIS_IP_);  // 释放FS回收锁
+	psi_memstall_leave(&pflags);      // 离开内存停滞状态
+	set_task_reclaim_state(current, NULL); // 清除当前任务的回收状态
 
-	/*
-	 * Return the order kswapd stopped reclaiming at as
-	 * prepare_kswapd_sleep() takes it into account. If another caller
-	 * entered the allocator slow path while kswapd was awake, order will
-	 * remain at the higher level.
-	 */
-	return sc.order;
+	// 注意：这个返回值会在kswapd()函数中用于判断是否重新进入休眠。如果实际回收
+	// 的阶数（reclaim_order）小于请求的阶数（alloc_order），则重新进入休眠检查
+	// 流程（可能因为又有新的请求到来，所以会再次尝试）。
+	return sc.order;  // 返回kswapd停止回收时的order，以便上层判断是否满足高阶分配
 }
 
 /*
