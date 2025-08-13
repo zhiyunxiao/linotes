@@ -5817,116 +5817,118 @@ static void lru_gen_shrink_node(struct pglist_data *pgdat, struct scan_control *
 
 static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 {
-	unsigned long nr[NR_LRU_LISTS];
-	unsigned long targets[NR_LRU_LISTS];
-	unsigned long nr_to_scan;
-	enum lru_list lru;
-	unsigned long nr_reclaimed = 0;
-	unsigned long nr_to_reclaim = sc->nr_to_reclaim;
-	bool proportional_reclaim;
-	struct blk_plug plug;
+	unsigned long nr[NR_LRU_LISTS];       // 各LRU类型需扫描页数
+	unsigned long targets[NR_LRU_LISTS];   // 原始扫描目标
+	unsigned long nr_to_scan;              // 当前扫描批次数量
+	enum lru_list lru;                     // LRU类型枚举
+	unsigned long nr_reclaimed = 0;        // 已回收页数
+	unsigned long nr_to_reclaim = sc->nr_to_reclaim; // 总体需回收页数
+	bool proportional_reclaim;             // 是否启用比例回收
+	struct blk_plug plug;                  // I/O合并优化
 
+	// 新一代LRU检测
+	// 条件：启用多代LRU且非全局回收时
+	// 行为：转用新一代回收算法并退出
 	if (lru_gen_enabled() && !root_reclaim(sc)) {
 		lru_gen_shrink_lruvec(lruvec, sc);
 		return;
 	}
 
-	get_scan_count(lruvec, sc, nr);
+	// 扫描目标计算
+	// get_scan_count()：综合考虑四因子计算扫描权重：
+	// 系统内存压力
+	// swap使用率
+	// cgroup限制
+	// 回收优先级 (sc->priority)
+	get_scan_count(lruvec, sc, nr);  // 计算各LRU的扫描权重
+	memcpy(targets, nr, sizeof(nr)); // 保存原始目标值
 
-	/* Record the original scan target for proportional adjustments later */
-	memcpy(targets, nr, sizeof(nr));
-
-	/*
-	 * Global reclaiming within direct reclaim at DEF_PRIORITY is a normal
-	 * event that can occur when there is little memory pressure e.g.
-	 * multiple streaming readers/writers. Hence, we do not abort scanning
-	 * when the requested number of pages are reclaimed when scanning at
-	 * DEF_PRIORITY on the assumption that the fact we are direct
-	 * reclaiming implies that kswapd is not keeping up and it is best to
-	 * do a batch of work at once. For memcg reclaim one check is made to
-	 * abort proportional reclaim if either the file or anon lru has already
-	 * dropped to zero at the first pass.
-	 */
+	// 比例回收标志
+	// 置位条件：
+	// 1. 非 Cgroup 回收
+	// 2. 当前进程非 kswapd (直接回收)
+	// 3. 优先级为默认优先级 (DEF_PRIORITY)
+	// 含义：允许直接回收在轻压力时完成整个批次扫描。
 	proportional_reclaim = (!cgroup_reclaim(sc) && !current_is_kswapd() &&
 				sc->priority == DEF_PRIORITY);
 
+	// I/O 优化
+	// 启动 Block I/O Plunging：合并后续产生的 I/O 请求，减少磁盘寻址开销。
 	blk_start_plug(&plug);
+	// 主回收循环
+	// 循环条件：匿名非活跃、文件活跃/非活跃 LRU 中仍有待扫描页。
 	while (nr[LRU_INACTIVE_ANON] || nr[LRU_ACTIVE_FILE] ||
 					nr[LRU_INACTIVE_FILE]) {
 		unsigned long nr_anon, nr_file, percentage;
 		unsigned long nr_scanned;
 
 		for_each_evictable_lru(lru) {
+			// 每次扫描最多 SWAP_CLUSTER_MAX (常为 32) 页
 			if (nr[lru]) {
 				nr_to_scan = min(nr[lru], SWAP_CLUSTER_MAX);
 				nr[lru] -= nr_to_scan;
 
+				// shrink_list()：执行实际的页回收（可能触发页面换出或释放）。
 				nr_reclaimed += shrink_list(lru, nr_to_scan,
 							    lruvec, sc);
 			}
 		}
 
+		// cond_resched()：主动让出 CPU 避免长时间占用。
 		cond_resched();
 
+		// 若未达总目标或启用比例回收，则继续下一轮循环。
 		if (nr_reclaimed < nr_to_reclaim || proportional_reclaim)
 			continue;
 
-		/*
-		 * For kswapd and memcg, reclaim at least the number of pages
-		 * requested. Ensure that the anon and file LRUs are scanned
-		 * proportionally what was requested by get_scan_count(). We
-		 * stop reclaiming one LRU and reduce the amount scanning
-		 * proportional to the original scan target.
-		 */
+		// 比例回收调整（达到目标后）
+		// 核心逻辑：当达成回收目标后，强制两种 LRU 按原始比例完成扫描：
+		// 1. 将占比更大的 LRU 类型扫描量置零（停止扫描）。
+		// 2. 根据已扫描比例，重新计算另一类型的剩余扫描量。
 		nr_file = nr[LRU_INACTIVE_FILE] + nr[LRU_ACTIVE_FILE];
 		nr_anon = nr[LRU_INACTIVE_ANON] + nr[LRU_ACTIVE_ANON];
 
-		/*
-		 * It's just vindictive to attack the larger once the smaller
-		 * has gone to zero.  And given the way we stop scanning the
-		 * smaller below, this makes sure that we only make one nudge
-		 * towards proportionality once we've got nr_to_reclaim.
-		 */
-		if (!nr_file || !nr_anon)
+		if (!nr_file || !nr_anon)  // 任一LRU降至0则退出
 			break;
 
+		// 计算占比更大的LRU类型
 		if (nr_file > nr_anon) {
 			unsigned long scan_target = targets[LRU_INACTIVE_ANON] +
-						targets[LRU_ACTIVE_ANON] + 1;
-			lru = LRU_BASE;
+						targets[LRU_ACTIVE_ANON] + 1;  // 避免除0
+			lru = LRU_BASE;         // 目标:匿名页
 			percentage = nr_anon * 100 / scan_target;
 		} else {
 			unsigned long scan_target = targets[LRU_INACTIVE_FILE] +
 						targets[LRU_ACTIVE_FILE] + 1;
-			lru = LRU_FILE;
+			lru = LRU_FILE;         // 目标:文件页
 			percentage = nr_file * 100 / scan_target;
 		}
 
-		/* Stop scanning the smaller of the LRU */
-		nr[lru] = 0;
-		nr[lru + LRU_ACTIVE] = 0;
+		// 停止扫描占比较大的LRU类型
+		nr[lru] = 0;                // 非活跃部分
+		nr[lru + LRU_ACTIVE] = 0;   // 活跃部分
 
-		/*
-		 * Recalculate the other LRU scan count based on its original
-		 * scan target and the percentage scanning already complete
-		 */
+		// 按比例重新计算另一LRU的扫描量
 		lru = (lru == LRU_FILE) ? LRU_BASE : LRU_FILE;
-		nr_scanned = targets[lru] - nr[lru];
+		nr_scanned = targets[lru] - nr[lru];       // 已扫描量
 		nr[lru] = targets[lru] * (100 - percentage) / 100;
-		nr[lru] -= min(nr[lru], nr_scanned);
+		nr[lru] -= min(nr[lru], nr_scanned);        // 减去已完成部分
 
+		// 活跃部分同理调整
 		lru += LRU_ACTIVE;
 		nr_scanned = targets[lru] - nr[lru];
 		nr[lru] = targets[lru] * (100 - percentage) / 100;
 		nr[lru] -= min(nr[lru], nr_scanned);
 	}
 	blk_finish_plug(&plug);
-	sc->nr_reclaimed += nr_reclaimed;
 
-	/*
-	 * Even if we did not try to evict anon pages at all, we want to
-	 * rebalance the anon lru active/inactive ratio.
-	 */
+	// 收尾操作
+	// 1. 更新全局回收计数。
+	// 2. 匿名页活跃/非活跃平衡：
+	//        条件：允许匿名页老化 + 非活跃匿名页过少。
+	//        操作：从活跃匿名链表 (LRU_ACTIVE_ANON) 回收页面到非活跃链表。
+	sc->nr_reclaimed += nr_reclaimed; // 更新总回收页数
+
 	if (can_age_anon_pages(lruvec, sc) &&
 	    inactive_is_low(lruvec, LRU_INACTIVE_ANON))
 		shrink_active_list(SWAP_CLUSTER_MAX, lruvec,
@@ -6003,56 +6005,49 @@ static inline bool should_continue_reclaim(struct pglist_data *pgdat,
 	return inactive_lru_pages > pages_for_compaction;
 }
 
+// 核心功能：在内存节点级别遍历并回收所有符合条件的memcgroup的内存资源
 static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 {
 	struct mem_cgroup *target_memcg = sc->target_mem_cgroup;
+	// reclaim cookie：记录节点信息的迭代状态跟踪器
 	struct mem_cgroup_reclaim_cookie reclaim = {
 		.pgdat = pgdat,
 	};
+	// partial：决定是否执行部分回收迭代
 	struct mem_cgroup_reclaim_cookie *partial = &reclaim;
 	struct mem_cgroup *memcg;
 
-	/*
-	 * In most cases, direct reclaimers can do partial walks
-	 * through the cgroup tree, using an iterator state that
-	 * persists across invocations. This strikes a balance between
-	 * fairness and allocation latency.
-	 *
-	 * For kswapd, reliable forward progress is more important
-	 * than a quick return to idle. Always do full walks.
-	 */
+	// 遍历策略决策
+	// 1. kswapd(后台回收)	全量遍历	确保稳定回收进度
+	// 2. 直接回收	增量遍历	降低延迟，提高响应速度
+	// 3. 主动回收	强制全量遍历	深度清洁(memcg_full_walk)
 	if (current_is_kswapd() || sc->memcg_full_walk)
 		partial = NULL;
 
+	// 开始memcg迭代
+	// 迭代初始化：
+	// 1. 获取第一个符合条件的memcg
+	// 2. 创建memcg+node关联的LRU向量
+	// 3. 准备记录本轮扫描统计的临时变量
 	memcg = mem_cgroup_iter(target_memcg, NULL, partial);
 	do {
 		struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
 		unsigned long reclaimed;
 		unsigned long scanned;
 
-		/*
-		 * This loop can become CPU-bound when target memcgs
-		 * aren't eligible for reclaim - either because they
-		 * don't have any reclaimable pages, or because their
-		 * memory is explicitly protected. Avoid soft lockups.
-		 */
+		// 防CPU死锁保护
+		// 重要机制：防止长时间运行导致CPU软死锁，特别针对：
+		// 1. 受保护memcg(无回收页)
+		// 2. 内存被显式保护的memcg    通过主动让出CPU避免系统冻结
 		cond_resched();
 
 		mem_cgroup_calculate_protection(target_memcg, memcg);
 
+		// 硬保护检查
 		if (mem_cgroup_below_min(target_memcg, memcg)) {
-			/*
-			 * Hard protection.
-			 * If there is no reclaimable memory, OOM.
-			 */
 			continue;
+		// 软保护检查
 		} else if (mem_cgroup_below_low(target_memcg, memcg)) {
-			/*
-			 * Soft protection.
-			 * Respect the protection only as long as
-			 * there is an unprotected supply
-			 * of reclaimable memory from other cgroups.
-			 */
 			if (!sc->memcg_low_reclaim) {
 				sc->memcg_low_skipped = 1;
 				continue;
@@ -6060,43 +6055,67 @@ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
 			memcg_memory_event(memcg, MEMCG_LOW);
 		}
 
+		// 核心回收操作
+		// 双层级回收：
+		// 1. 页面缓存回收：扫描LRU链表回收文件页/匿名页
+		// 2. Slab缓存回收：清理dentry/inode等内核对象缓存
 		reclaimed = sc->nr_reclaimed;
 		scanned = sc->nr_scanned;
 
+		// 回收页面缓存
 		shrink_lruvec(lruvec, sc);
 
+		// 回收Slab缓存
 		shrink_slab(sc->gfp_mask, pgdat->node_id, memcg,
 			    sc->priority);
 
-		/* Record the group's reclaim efficiency */
+		// cgroup级压力反馈
 		if (!sc->proactive)
+			// 压力计算：
+			// 压力值 = (回收页数 / 扫描页数) * 100%
+			// 通知用户空间守护进程(如Android的lmkd)
 			vmpressure(sc->gfp_mask, memcg, false,
 				   sc->nr_scanned - scanned,
 				   sc->nr_reclaimed - reclaimed);
 
-		/* If partial walks are allowed, bail once goal is reached */
+		// 增量回收优化
+		// 增量回收特性：
+		// 1. 仅适用于直接回收进程(!kswapd)
+		// 2. 当达到回收目标(nr_to_reclaim)立即终止
+		// 3. 保存断点(mem_cgroup_iter_break)供下次增量使用
 		if (partial && sc->nr_reclaimed >= sc->nr_to_reclaim) {
 			mem_cgroup_iter_break(target_memcg, memcg);
 			break;
 		}
+	// 迭代继续条件
+	// 迭代器行为：
+	// 1. 全量模式(partial=NULL)：深度优先遍历整颗memcg树
+	// 2. 增量模式(partial!=NULL)：基于上次断点继续
+	// 3. 终止条件：返回NULL表示无更多需回收的memcg
 	} while ((memcg = mem_cgroup_iter(target_memcg, memcg, partial)));
 }
 
+// 核心功能：在内存节点级别执行实际内存回收操作，协调脏页处理、写回限制和进程节流机制
 static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 {
 	unsigned long nr_reclaimed, nr_scanned, nr_node_reclaimed;
 	struct lruvec *target_lruvec;
 	bool reclaimable = false;
 
+	// 新一代LRU处理 (可选)
+	// 条件：当启用多代LRU且为全局回收时
+	// 优势：更高效的页面老化策略，减少扫描开销
 	if (lru_gen_enabled() && root_reclaim(sc)) {
 		memset(&sc->nr, 0, sizeof(sc->nr));
-		lru_gen_shrink_node(pgdat, sc);
+		lru_gen_shrink_node(pgdat, sc); // 使用新一代LRU算法
 		return;
 	}
 
+	// target_lruvec：指向内存cgroup或节点的LRU向量
 	target_lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup, pgdat);
 
 again:
+	// sc->nr：记录各类页面状态的计数器结构体
 	memset(&sc->nr, 0, sizeof(sc->nr));
 
 	nr_reclaimed = sc->nr_reclaimed;
@@ -6104,14 +6123,18 @@ again:
 
 	prepare_scan_control(pgdat, sc);
 
-	shrink_node_memcgs(pgdat, sc);
+	// 分层扫描内存cgroup
+	// 平衡不同cgroup间的回收压力
+	// 聚合各CPU的回收统计
+	shrink_node_memcgs(pgdat, sc); // 遍历memcg执行回收
+	flush_reclaim_state(sc);        // 刷新CPU本地状态到全局
+	nr_node_reclaimed = sc->nr_reclaimed - nr_reclaimed; // 本周期回收量
 
-	flush_reclaim_state(sc);
-
-	nr_node_reclaimed = sc->nr_reclaimed - nr_reclaimed;
-
-	/* Record the subtree's reclaim efficiency */
+	// 压力反馈机制
 	if (!sc->proactive)
+	 	// vmpressure系统：向用户空间发送内存压力事件
+		// 计算：压力程度 = 回收量/扫描量
+		// 通知Android/OOMD等内存监控进程
 		vmpressure(sc->gfp_mask, sc->target_mem_cgroup, true,
 			   sc->nr_scanned - nr_scanned, nr_node_reclaimed);
 
@@ -6119,82 +6142,60 @@ again:
 		reclaimable = true;
 
 	if (current_is_kswapd()) {
-		/*
-		 * If reclaim is isolating dirty pages under writeback,
-		 * it implies that the long-lived page allocation rate
-		 * is exceeding the page laundering rate. Either the
-		 * global limits are not being effective at throttling
-		 * processes due to the page distribution throughout
-		 * zones or there is heavy usage of a slow backing
-		 * device. The only option is to throttle from reclaim
-		 * context which is not ideal as there is no guarantee
-		 * the dirtying process is throttled in the same way
-		 * balance_dirty_pages() manages.
-		 *
-		 * Once a node is flagged PGDAT_WRITEBACK, kswapd will
-		 * count the number of pages under pages flagged for
-		 * immediate reclaim and stall if any are encountered
-		 * in the nr_immediate check below.
-		 */
+		// 情况1：完全写回状态：所有回收页都需写回
 		if (sc->nr.writeback && sc->nr.writeback == sc->nr.taken)
 			set_bit(PGDAT_WRITEBACK, &pgdat->flags);
 
-		/* Allow kswapd to start writing pages during reclaim.*/
+		// 情况2：脏页堆积状态：文件脏页未被加入写回队列
 		if (sc->nr.unqueued_dirty &&
 			sc->nr.unqueued_dirty == sc->nr.file_taken)
 			set_bit(PGDAT_DIRTY, &pgdat->flags);
 
-		/*
-		 * If kswapd scans pages marked for immediate
-		 * reclaim and under writeback (nr_immediate), it
-		 * implies that pages are cycling through the LRU
-		 * faster than they are written so forcibly stall
-		 * until some pages complete writeback.
-		 */
+		// 情况3：紧急回收状态：需立即回收的写回页
 		if (sc->nr.immediate)
 			reclaim_throttle(pgdat, VMSCAN_THROTTLE_WRITEBACK);
 	}
 
-	/*
-	 * Tag a node/memcg as congested if all the dirty pages were marked
-	 * for writeback and immediate reclaim (counted in nr.congested).
-	 *
-	 * Legacy memcg will stall in page writeback so avoid forcibly
-	 * stalling in reclaim_throttle().
-	 */
+	// 拥塞控制机制
+	// 拥塞条件：当 所有脏页 同时满足：
+	// 1. 需要写回(脏页)
+	// 2. 需要立即回收(拥塞状态)
 	if (sc->nr.dirty && sc->nr.dirty == sc->nr.congested) {
+		// memcgroup拥塞标记
 		if (cgroup_reclaim(sc) && writeback_throttling_sane(sc))
 			set_bit(LRUVEC_CGROUP_CONGESTED, &target_lruvec->flags);
 
+		// 节点级拥塞标记
 		if (current_is_kswapd())
 			set_bit(LRUVEC_NODE_CONGESTED, &target_lruvec->flags);
 	}
 
-	/*
-	 * Stall direct reclaim for IO completions if the lruvec is
-	 * node is congested. Allow kswapd to continue until it
-	 * starts encountering unqueued dirty pages or cycling through
-	 * the LRU too quickly.
-	 */
+	// 节流控制策略
+	// 节流触发条件：
+	// 1. 直接回收进程(非kswapd)
+	// 2. 当前允许节流
+	// 3. cgroup或节点标记为拥塞   效果：阻塞进程直到拥塞缓解
 	if (!current_is_kswapd() && current_may_throttle() &&
 	    !sc->hibernation_mode &&
 	    (test_bit(LRUVEC_CGROUP_CONGESTED, &target_lruvec->flags) ||
 	     test_bit(LRUVEC_NODE_CONGESTED, &target_lruvec->flags)))
 		reclaim_throttle(pgdat, VMSCAN_THROTTLE_CONGESTED);
 
+	// 回收延续决策
+	// should_continue_reclaim 检查：
+	// 1. 扫描比例是否达标
+	// 2. 回收效率是否过低
+	// 3. 是否仍低于水位线    循环本质：内存回收达不到目标时重试
 	if (should_continue_reclaim(pgdat, nr_node_reclaimed, sc))
 		goto again;
 
-	/*
-	 * Kswapd gives up on balancing particular nodes after too
-	 * many failures to reclaim anything from them and goes to
-	 * sleep. On reclaim progress, reset the failure counter. A
-	 * successful direct reclaim run will revive a dormant kswapd.
-	 */
+	// 结果反馈：
+	// 1. 回收成功：清除失败计数
+	// 2. 完全失败：标记特殊状态供后续处理
 	if (reclaimable)
-		pgdat->kswapd_failures = 0;
+		pgdat->kswapd_failures = 0;  // 重置失败计数
 	else if (sc->cache_trim_mode)
-		sc->cache_trim_mode_failed = 1;
+		sc->cache_trim_mode_failed = 1; // 记录缓存修剪失败
 }
 
 /*
