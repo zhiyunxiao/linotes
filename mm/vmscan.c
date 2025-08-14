@@ -2008,220 +2008,250 @@ static int current_may_throttle(void)
  * shrink_inactive_list() is a helper for shrink_node().  It returns the number
  * of reclaimed pages
  */
+// 从非活动 LRU 链表 (INACTIVE_ANON/INACTIVE_FILE) 扫描并回收页面，返回实际回收的页面数。
+// nr_to_scan：目标扫描的页面数。
+// lruvec：LRU 链表管理单元。
+// sc：内存回收控制参数。
+// lru：指定操作的非活动链表类型（文件页/匿名页）。
+// 返回值：成功回收的页面数。
 static unsigned long shrink_inactive_list(unsigned long nr_to_scan,
 		struct lruvec *lruvec, struct scan_control *sc,
 		enum lru_list lru)
 {
-	LIST_HEAD(folio_list);
-	unsigned long nr_scanned;
-	unsigned int nr_reclaimed = 0;
-	unsigned long nr_taken;
-	struct reclaim_stat stat;
-	bool file = is_file_lru(lru);
-	enum vm_event_item item;
-	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
-	bool stalled = false;
+	LIST_HEAD(folio_list);           // 临时链表：存放待处理的页面
+	unsigned long nr_scanned;        // 实际扫描的页面数
+	unsigned int nr_reclaimed = 0;   // 成功回收的页面数（初始为0）
+	unsigned long nr_taken;          // 从LRU取出的页面数
+	struct reclaim_stat stat;        // 记录回收统计信息
+	bool file = is_file_lru(lru);    // 文件页（true）或匿名页（false）
+	enum vm_event_item item;         // 事件类型（PGSCAN_KSWAPD等）
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec); // 关联的NUMA节点
+	bool stalled = false;            // 是否因拥塞而阻塞
 
+	// 拥塞控制（防止过多隔离页面）
+	// 作用：确保系统中隔离页面（正在回收）的数量不超过阈值，避免过度占用内存。
 	while (unlikely(too_many_isolated(pgdat, file, sc))) {
 		if (stalled)
-			return 0;
+			// 若阻塞过一次 (stalled=true)，直接返回 0。
+			return 0;          // 已阻塞过则放弃回收
 
-		/* wait a bit for the reclaimer. */
 		stalled = true;
-		reclaim_throttle(pgdat, VMSCAN_THROTTLE_ISOLATED);
+		// 首次阻塞时调用 reclaim_throttle()，让出 CPU 并等待其他回收线程完成。
+		reclaim_throttle(pgdat, VMSCAN_THROTTLE_ISOLATED); // 主动阻塞等待
 
-		/* We are about to die and free our memory. Return now. */
-		if (fatal_signal_pending(current))
+		// 若进程收到终止信号 (如 kill -9)，返回最大回收值（SWAP_CLUSTER_MAX）
+		// 以便快速退出。
+		if (fatal_signal_pending(current)) // 收到终止信号则强制返回
 			return SWAP_CLUSTER_MAX;
 	}
 
-	lru_add_drain();
+	// 提取非活动页面
+	lru_add_drain();  // 确保LRU缓存中的页面已加入链表
 
-	spin_lock_irq(&lruvec->lru_lock);
+	spin_lock_irq(&lruvec->lru_lock); // 禁用中断并加锁
 
+	// isolate_lru_folios()：从非活动链表批量取出页面（持有锁时操作）
+	// 到临时链表
 	nr_taken = isolate_lru_folios(nr_to_scan, lruvec, &folio_list,
 				     &nr_scanned, sc, lru);
-
+	
+	// 更新节点隔离页面计数（NR_ISOLATED_ANON/FILE）
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
+	// 记录页面扫描事件（区分kswapd/直接回收）
 	item = PGSCAN_KSWAPD + reclaimer_offset(sc);
 	if (!cgroup_reclaim(sc))
-		__count_vm_events(item, nr_scanned);
-	count_memcg_events(lruvec_memcg(lruvec), item, nr_scanned);
-	__count_vm_events(PGSCAN_ANON + file, nr_scanned);
+		__count_vm_events(item, nr_scanned);  // 全局事件
+	count_memcg_events(lruvec_memcg(lruvec), item, nr_scanned); // CGroup事件
+	// 记录扫描事件 PGSCAN_*（区分回收器类型）
+	__count_vm_events(PGSCAN_ANON + file, nr_scanned); // 匿名/文件页事件
 
-	spin_unlock_irq(&lruvec->lru_lock);
+	spin_unlock_irq(&lruvec->lru_lock); // 解锁并恢复中断
 
-	if (nr_taken == 0)
+	// 回收页面核心逻辑
+	if (nr_taken == 0) // 未取出页面则直接退出
 		return 0;
 
+	// shrink_folio_list() 是回收页面的核心函数：
+	// 1. 对临时链表中的每个页面执行回收（如：写回磁盘、释放内存、加入交换区等）。
+	// 2. 返回实际回收的页面数 nr_reclaimed。
+	// 3. 填充回收统计 stat（例如：脏页/写回页数量）。
+	// 尝试回收页面！核心函数返回实际回收数量
 	nr_reclaimed = shrink_folio_list(&folio_list, pgdat, sc, &stat, false,
 					 lruvec_memcg(lruvec));
 
 	spin_lock_irq(&lruvec->lru_lock);
-	move_folios_to_lru(lruvec, &folio_list);
+	// move_folios_to_lru()：将未被回收的页面放回 LRU 链表（可能因状态变化
+	// 进入活动或非活动链表）。
+	move_folios_to_lru(lruvec, &folio_list); // 将未回收的页面放回LRU链表
 
+	// 记录降级事件（PGDEMOTE_*：活跃→非活跃）
 	__mod_lruvec_state(lruvec, PGDEMOTE_KSWAPD + reclaimer_offset(sc),
 					stat.nr_demoted);
+	// 解除页面的隔离状态
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
+	// 记录页面窃取事件（PGSTEAL_*：成功回收）
 	item = PGSTEAL_KSWAPD + reclaimer_offset(sc);
 	if (!cgroup_reclaim(sc))
 		__count_vm_events(item, nr_reclaimed);
 	count_memcg_events(lruvec_memcg(lruvec), item, nr_reclaimed);
+	// 记录成功回收的页面数。
 	__count_vm_events(PGSTEAL_ANON + file, nr_reclaimed);
 	spin_unlock_irq(&lruvec->lru_lock);
 
+	// 反馈机制与延迟控制
+	// 记录回收成本，动态调整未来扫描压力
+	// stat.nr_pageout：需写回磁盘的页面数（高开销操作）。
+	// nr_scanned - nr_reclaimed：扫描但未回收的页面数（无效扫描）。
+	// 这些信息用于调整未来扫描的优先级和频率（避免高开销操作）。
 	lru_note_cost(lruvec, file, stat.nr_pageout, nr_scanned - nr_reclaimed);
 
-	/*
-	 * If dirty folios are scanned that are not queued for IO, it
-	 * implies that flushers are not doing their job. This can
-	 * happen when memory pressure pushes dirty folios to the end of
-	 * the LRU before the dirty limits are breached and the dirty
-	 * data has expired. It can also happen when the proportion of
-	 * dirty folios grows not through writes but through memory
-	 * pressure reclaiming all the clean cache. And in some cases,
-	 * the flushers simply cannot keep up with the allocation
-	 * rate. Nudge the flusher threads in case they are asleep.
-	 */
+	// 脏页写回优化
+	// 唤醒回写线程处理未排队的脏页
+	// 当所有取出的页面都是未排队的脏页（nr_unqueued_dirty == nr_taken）
+	// ，说明回写线程未及时工作。
 	if (stat.nr_unqueued_dirty == nr_taken) {
+		// 唤醒回写线程：调用 wakeup_flusher_threads() 强制启动脏页写回。
 		wakeup_flusher_threads(WB_REASON_VMSCAN);
-		/*
-		 * For cgroupv1 dirty throttling is achieved by waking up
-		 * the kernel flusher here and later waiting on folios
-		 * which are in writeback to finish (see shrink_folio_list()).
-		 *
-		 * Flusher may not be able to issue writeback quickly
-		 * enough for cgroupv1 writeback throttling to work
-		 * on a large system.
-		 */
+		// CGroup v1 回写限流优化
+		// 限流优化：针对 CGroup v1 的特殊处理，避免回写线程无法跟上内存分配速度。
 		if (!writeback_throttling_sane(sc))
 			reclaim_throttle(pgdat, VMSCAN_THROTTLE_WRITEBACK);
 	}
 
+	// 更新控制参数与跟踪
+	// 将统计信息汇总到 scan_control
+	// sc->nr 字段用于全局跟踪回收状态（如回写压力、拥塞情况）。
+	// 文件页回收数单独记录（因文件页回收通常更高效）。
 	sc->nr.dirty += stat.nr_dirty;
 	sc->nr.congested += stat.nr_congested;
 	sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
 	sc->nr.writeback += stat.nr_writeback;
 	sc->nr.immediate += stat.nr_immediate;
-	sc->nr.taken += nr_taken;
+	sc->nr.taken += nr_taken; // 文件页单独计数
 	if (file)
 		sc->nr.file_taken += nr_taken;
 
+	// 调试跟踪：记录详细回收信息
 	trace_mm_vmscan_lru_shrink_inactive(pgdat->node_id,
 			nr_scanned, nr_reclaimed, &stat, sc->priority, file);
-	return nr_reclaimed;
+	return nr_reclaimed; // 返回实际回收的页面数
 }
 
-/*
- * shrink_active_list() moves folios from the active LRU to the inactive LRU.
- *
- * We move them the other way if the folio is referenced by one or more
- * processes.
- *
- * If the folios are mostly unmapped, the processing is fast and it is
- * appropriate to hold lru_lock across the whole operation.  But if
- * the folios are mapped, the processing is slow (folio_referenced()), so
- * we should drop lru_lock around each folio.  It's impossible to balance
- * this, so instead we remove the folios from the LRU while processing them.
- * It is safe to rely on the active flag against the non-LRU folios in here
- * because nobody will play with that bit on a non-LRU folio.
- *
- * The downside is that we have to touch folio->_refcount against each folio.
- * But we had to alter folio->flags anyway.
- */
+// 目的：从活动 LRU 链表 (ACTIVE_ANON 或 ACTIVE_FILE) 中扫描并尝试
+// 将页面降级到非活动链表 (INACTIVE_ANON 或 INACTIVE_FILE)。
+// 参数：
+// nr_to_scan：目标扫描的页面数。
+// lruvec：管理 LRU 链表的逻辑单元（通常按 NUMA 节点或内存组划分）。
+// sc：内存回收的控制参数（如优先级、目标内存组）。
+// lru：指定操作的活动 LRU 类型（文件页或匿名页）。
 static void shrink_active_list(unsigned long nr_to_scan,
 			       struct lruvec *lruvec,
 			       struct scan_control *sc,
 			       enum lru_list lru)
 {
-	unsigned long nr_taken;
-	unsigned long nr_scanned;
-	unsigned long vm_flags;
-	LIST_HEAD(l_hold);	/* The folios which were snipped off */
-	LIST_HEAD(l_active);
-	LIST_HEAD(l_inactive);
-	unsigned nr_deactivate, nr_activate;
-	unsigned nr_rotated = 0;
-	bool file = is_file_lru(lru);
-	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+	unsigned long nr_taken;          // 从 LRU 链表成功取出的页面数
+	unsigned long nr_scanned;         // 实际扫描的页面数
+	unsigned long vm_flags;           // 页面的 VM 访问标志（如是否可执行）
+	LIST_HEAD(l_hold);               // 临时链表：存储从 LRU 取出的所有页面
+	LIST_HEAD(l_active);             // 临时链表：继续保留在活动链表的页面
+	LIST_HEAD(l_inactive);           // 临时链表：待降级到非活动链表的页面
+	unsigned nr_deactivate, nr_activate; // 实际降级/激活的页面数
+	unsigned nr_rotated = 0;         // 因访问被“旋转”回活动链表的页面数
+	bool file = is_file_lru(lru);     // 当前操作的文件页 (true) 或匿名页 (false)
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec); // 关联的 NUMA 节点
 
+	// LRU 缓存预热
+	// 作用：清空当前 CPU 的 LRU 页面缓存（lru_pvecs），确保之后的操作基于最新状态。
 	lru_add_drain();
 
+	// 锁定 LRU 并提取页面
+	// 锁定：禁用中断并获取 lruvec->lru_lock，防止并发访问。
 	spin_lock_irq(&lruvec->lru_lock);
-
+	// 提取页面：从活动链表中分离 nr_to_scan 个页面到临时链表 l_hold，返回实际取出
+	// 的页面数 (nr_taken) 和扫描数 (nr_scanned)。
 	nr_taken = isolate_lru_folios(nr_to_scan, lruvec, &l_hold,
 				     &nr_scanned, sc, lru);
 
+	// 更新内存统计
+	// 记录隔离页面：更新节点统计，标记页面处于隔离状态 (NR_ISOLATED_ANON/FILE)。
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, nr_taken);
 
+	// 记录填充事件：全局事件 PGREFILL：非 CGroup 回收时记录扫描量。
 	if (!cgroup_reclaim(sc))
 		__count_vm_events(PGREFILL, nr_scanned);
+	// 记录填充事件：CGroup 事件：记录内存组的扫描量。
 	count_memcg_events(lruvec_memcg(lruvec), PGREFILL, nr_scanned);
-
+	// 解锁：释放 LRU 锁，允许中断和其他操作。
 	spin_unlock_irq(&lruvec->lru_lock);
 
+	// 逐页检查并分类
 	while (!list_empty(&l_hold)) {
 		struct folio *folio;
 
-		cond_resched();
+		cond_resched(); // 主动让出 CPU，避免长时间占用
 		folio = lru_to_folio(&l_hold);
-		list_del(&folio->lru);
+		list_del(&folio->lru); // 从临时链表移除
 
+		// 不可回收处理：若页面被锁定（如 mlock），直接放回原链表。
 		if (unlikely(!folio_evictable(folio))) {
-			folio_putback_lru(folio);
+			folio_putback_lru(folio); // 放回原 LRU 链表
 			continue;
 		}
 
+		// 缓冲区超限处理：当系统文件缓存过大时，尝试释放页面的缓冲区头。
 		if (unlikely(buffer_heads_over_limit)) {
 			if (folio_needs_release(folio) &&
 			    folio_trylock(folio)) {
-				filemap_release_folio(folio, 0);
+				filemap_release_folio(folio, 0); // 尝试释放缓存
 				folio_unlock(folio);
 			}
 		}
 
-		/* Referenced or rmap lock contention: rotate */
+		// 页面引用检查：
+		// 关键逻辑：通过 folio_referenced 检测页面近期是否被访问：
+		//     可执行文件页：若被访问（VM_EXEC），视为活跃页面，
+		//     加入 l_active 并计数 (nr_rotated)。
+		//     匿名页：即使被访问也不保留（避免 JVM 等大量临时匿名页
+		//     影响回收效率）。
 		if (folio_referenced(folio, 0, sc->target_mem_cgroup,
 				     &vm_flags) != 0) {
-			/*
-			 * Identify referenced, file-backed active folios and
-			 * give them one more trip around the active list. So
-			 * that executable code get better chances to stay in
-			 * memory under moderate memory pressure.  Anon folios
-			 * are not likely to be evicted by use-once streaming
-			 * IO, plus JVM can create lots of anon VM_EXEC folios,
-			 * so we ignore them here.
-			 */
 			if ((vm_flags & VM_EXEC) && folio_is_file_lru(folio)) {
 				nr_rotated += folio_nr_pages(folio);
-				list_add(&folio->lru, &l_active);
+				list_add(&folio->lru, &l_active); // 保留在活动链表
 				continue;
 			}
 		}
 
-		folio_clear_active(folio);	/* we are de-activating */
-		folio_set_workingset(folio);
-		list_add(&folio->lru, &l_inactive);
+		// 降级到非活动链表：
+		folio_clear_active(folio);     // 清除活动标志
+		folio_set_workingset(folio);   // 标记为工作集（参与第二次机会）
+		list_add(&folio->lru, &l_inactive); // 加入待降级链表
 	}
 
-	/*
-	 * Move folios back to the lru list.
-	 */
+	// 移动页面回 LRU, 锁定并移动：
 	spin_lock_irq(&lruvec->lru_lock);
 
+	// 将 l_active 放回活动链表，更新 nr_activate。
 	nr_activate = move_folios_to_lru(lruvec, &l_active);
+	// 将 l_inactive 移到非活动链表，更新 nr_deactivate。
 	nr_deactivate = move_folios_to_lru(lruvec, &l_inactive);
 
+	// 更新统计：记录全局和 CGroup 的降级事件 (PGDEACTIVATE)。
 	__count_vm_events(PGDEACTIVATE, nr_deactivate);
 	count_memcg_events(lruvec_memcg(lruvec), PGDEACTIVATE, nr_deactivate);
 
+	// 更新统计：解除页面的隔离状态（减少 NR_ISOLATED_* 计数）。
 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
 	spin_unlock_irq(&lruvec->lru_lock);
 
+	// 后期处理与跟踪
 	if (nr_rotated)
-		lru_note_cost(lruvec, file, 0, nr_rotated);
+		// 成本反馈：lru_note_cost 根据 nr_rotated 调整未来扫描优先级
+		// （避免频繁扫描活跃页面）。
+		lru_note_cost(lruvec, file, 0, nr_rotated); // 记录旋转成本，平衡后续扫描压力
+	// 调试信息：记录详细参数供内存回收跟踪器分析。
 	trace_mm_vmscan_lru_shrink_active(pgdat->node_id, nr_taken, nr_activate,
-			nr_deactivate, nr_rotated, sc->priority, file);
+			nr_deactivate, nr_rotated, sc->priority, file); // 调试跟踪
 }
 
 static unsigned int reclaim_folio_list(struct list_head *folio_list,
@@ -5879,6 +5909,7 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 
 		// 若未达总目标或启用比例回收，则继续下一轮循环。
 		if (nr_reclaimed < nr_to_reclaim || proportional_reclaim)
+			// 直到按比例计算出的nr全部扫描完毕
 			continue;
 
 		// 比例回收调整（达到目标后）
