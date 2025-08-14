@@ -1112,25 +1112,31 @@ static bool may_enter_fs(struct folio *folio, gfp_t gfp_mask)
 /*
  * shrink_folio_list() returns the number of reclaimed pages
  */
+// 该函数是 Linux 内存回收的核心逻辑，处理从 LRU 链表分离的 Folio 页帧，
+// 通过页面回写、解映射等操作回收内存。返回成功回收的页数。
 static unsigned int shrink_folio_list(struct list_head *folio_list,
 		struct pglist_data *pgdat, struct scan_control *sc,
 		struct reclaim_stat *stat, bool ignore_references,
 		struct mem_cgroup *memcg)
 {
-	struct folio_batch free_folios;
-	LIST_HEAD(ret_folios);
-	LIST_HEAD(demote_folios);
-	unsigned int nr_reclaimed = 0, nr_demoted = 0;
-	unsigned int pgactivate = 0;
-	bool do_demote_pass;
-	struct swap_iocb *plug = NULL;
+	struct folio_batch free_folios;          // 缓存待释放的 Folio 批次
+	LIST_HEAD(ret_folios);                   // 需放回 LRU 的 Folio 链表
+	LIST_HEAD(demote_folios);                // 需降级迁移的 Folio 链表
+	unsigned int nr_reclaimed = 0, nr_demoted = 0; // 已回收/降级的页数
+	unsigned int pgactivate = 0;             // 激活的页数统计
+	bool do_demote_pass;                     // 是否执行降级迁移
+	struct swap_iocb *plug = NULL;           // Swap I/O 聚合插槽
 
+	// folio_batch_init(&free_folios)：初始化批量释放结构。
 	folio_batch_init(&free_folios);
+	// memset(stat, 0, sizeof(*stat))：清零回收统计。
 	memset(stat, 0, sizeof(*stat));
 	cond_resched();
+	// do_demote_pass = can_demote(...)：检查是否允许降级迁移。
 	do_demote_pass = can_demote(pgdat->node_id, sc, memcg);
 
 retry:
+	// 主循环：遍历 Folio 链表
 	while (!list_empty(folio_list)) {
 		struct address_space *mapping;
 		struct folio *folio;
@@ -1138,22 +1144,25 @@ retry:
 		bool dirty, writeback;
 		unsigned int nr_pages;
 
+		// 每处理一个 Folio 前调用 cond_resched() 避免占用 CPU 过久。
 		cond_resched();
 
-		folio = lru_to_folio(folio_list);
-		list_del(&folio->lru);
+		folio = lru_to_folio(folio_list);    // 获取链表首个 Folio
+		list_del(&folio->lru);               // 从链表移除
 
+		// 1. Folio 锁定与基础检查
 		if (!folio_trylock(folio))
-			goto keep;
+			goto keep;     // 尝试加锁，失败则暂不处理
 
-		if (folio_contain_hwpoisoned_page(folio)) {
+		if (folio_contain_hwpoisoned_page(folio)) { // 跳过硬件损坏页
+			// 移除硬件损坏页：解映射、解锁并释放。
 			unmap_poisoned_folio(folio, folio_pfn(folio), false);
 			folio_unlock(folio);
 			folio_put(folio);
 			continue;
 		}
 
-		VM_BUG_ON_FOLIO(folio_test_active(folio), folio);
+		VM_BUG_ON_FOLIO(folio_test_active(folio), folio); // 确保非活跃状态
 
 		nr_pages = folio_nr_pages(folio);
 
@@ -1166,108 +1175,40 @@ retry:
 		if (!sc->may_unmap && folio_mapped(folio))
 			goto keep_locked;
 
-		/*
-		 * The number of dirty pages determines if a node is marked
-		 * reclaim_congested. kswapd will stall and start writing
-		 * folios if the tail of the LRU is all dirty unqueued folios.
-		 */
-		folio_check_dirty_writeback(folio, &dirty, &writeback);
+		// 脏页/回写状态处理
+		folio_check_dirty_writeback(folio, &dirty, &writeback); // 检查脏页/回写状态
+
+		// 统计脏页信息（nr_dirty, nr_unqueued_dirty, nr_congested）。
 		if (dirty || writeback)
 			stat->nr_dirty += nr_pages;
 
 		if (dirty && !writeback)
 			stat->nr_unqueued_dirty += nr_pages;
 
-		/*
-		 * Treat this folio as congested if folios are cycling
-		 * through the LRU so quickly that the folios marked
-		 * for immediate reclaim are making it to the end of
-		 * the LRU a second time.
-		 */
 		if (writeback && folio_test_reclaim(folio))
 			stat->nr_congested += nr_pages;
 
-		/*
-		 * If a folio at the tail of the LRU is under writeback, there
-		 * are three cases to consider.
-		 *
-		 * 1) If reclaim is encountering an excessive number
-		 *    of folios under writeback and this folio has both
-		 *    the writeback and reclaim flags set, then it
-		 *    indicates that folios are being queued for I/O but
-		 *    are being recycled through the LRU before the I/O
-		 *    can complete. Waiting on the folio itself risks an
-		 *    indefinite stall if it is impossible to writeback
-		 *    the folio due to I/O error or disconnected storage
-		 *    so instead note that the LRU is being scanned too
-		 *    quickly and the caller can stall after the folio
-		 *    list has been processed.
-		 *
-		 * 2) Global or new memcg reclaim encounters a folio that is
-		 *    not marked for immediate reclaim, or the caller does not
-		 *    have __GFP_FS (or __GFP_IO if it's simply going to swap,
-		 *    not to fs), or the folio belongs to a mapping where
-		 *    waiting on writeback during reclaim may lead to a deadlock.
-		 *    In this case mark the folio for immediate reclaim and
-		 *    continue scanning.
-		 *
-		 *    Require may_enter_fs() because we would wait on fs, which
-		 *    may not have submitted I/O yet. And the loop driver might
-		 *    enter reclaim, and deadlock if it waits on a folio for
-		 *    which it is needed to do the write (loop masks off
-		 *    __GFP_IO|__GFP_FS for this reason); but more thought
-		 *    would probably show more reasons.
-		 *
-		 * 3) Legacy memcg encounters a folio that already has the
-		 *    reclaim flag set. memcg does not have any dirty folio
-		 *    throttling so we could easily OOM just because too many
-		 *    folios are in writeback and there is nothing else to
-		 *    reclaim. Wait for the writeback to complete.
-		 *
-		 * In cases 1) and 2) we activate the folios to get them out of
-		 * the way while we continue scanning for clean folios on the
-		 * inactive list and refilling from the active list. The
-		 * observation here is that waiting for disk writes is more
-		 * expensive than potentially causing reloads down the line.
-		 * Since they're marked for immediate reclaim, they won't put
-		 * memory pressure on the cache working set any longer than it
-		 * takes to write them to disk.
-		 */
 		if (folio_test_writeback(folio)) {
 			mapping = folio_mapping(folio);
 
-			/* Case 1 above */
+			// Case 1：kswapd 遇高回写压力，立即激活。
 			if (current_is_kswapd() &&
 			    folio_test_reclaim(folio) &&
 			    test_bit(PGDAT_WRITEBACK, &pgdat->flags)) {
 				stat->nr_immediate += nr_pages;
 				goto activate_locked;
 
-			/* Case 2 above */
+			// Case 2：全局回收需避免死锁，标记回收标志后激活。
 			} else if (writeback_throttling_sane(sc) ||
 			    !folio_test_reclaim(folio) ||
 			    !may_enter_fs(folio, sc->gfp_mask) ||
 			    (mapping &&
 			     mapping_writeback_may_deadlock_on_reclaim(mapping))) {
-				/*
-				 * This is slightly racy -
-				 * folio_end_writeback() might have
-				 * just cleared the reclaim flag, then
-				 * setting the reclaim flag here ends up
-				 * interpreted as the readahead flag - but
-				 * that does not matter enough to care.
-				 * What we do want is for this folio to
-				 * have the reclaim flag set next time
-				 * memcg reclaim reaches the tests above,
-				 * so it will then wait for writeback to
-				 * avoid OOM; and it's also appropriate
-				 * in global reclaim.
-				 */
 				folio_set_reclaim(folio);
 				stat->nr_writeback += nr_pages;
 				goto activate_locked;
 
-			/* Case 3 above */
+			// Case 3：传统 memcg 等待回写完成。
 			} else {
 				folio_unlock(folio);
 				folio_wait_writeback(folio);
@@ -1278,35 +1219,29 @@ retry:
 		}
 
 		if (!ignore_references)
-			references = folio_check_references(folio, sc);
+			references = folio_check_references(folio, sc);  // 检查引用次数
 
+		// 引用检查是决定回收/激活的关键（通过反向映射计算）。
 		switch (references) {
-		case FOLIOREF_ACTIVATE:
+		case FOLIOREF_ACTIVATE:  // 激活
 			goto activate_locked;
-		case FOLIOREF_KEEP:
+		case FOLIOREF_KEEP:      // 保留
 			stat->nr_ref_keep += nr_pages;
 			goto keep_locked;
-		case FOLIOREF_RECLAIM:
+		case FOLIOREF_RECLAIM:   // 尝试回收
 		case FOLIOREF_RECLAIM_CLEAN:
 			; /* try to reclaim the folio below */
 		}
 
-		/*
-		 * Before reclaiming the folio, try to relocate
-		 * its contents to another node.
-		 */
+		// 将冷页迁移到低速内存层级（如 DRAM → CXL）。
 		if (do_demote_pass &&
 		    (thp_migration_supported() || !folio_test_large(folio))) {
-			list_add(&folio->lru, &demote_folios);
+			list_add(&folio->lru, &demote_folios); // 加入降级链表
 			folio_unlock(folio);
 			continue;
 		}
 
-		/*
-		 * Anonymous process memory has backing store?
-		 * Try to allocate it some swap space here.
-		 * Lazyfree folio could be freed directly
-		 */
+		// 匿名页交换空间分配：为匿名页分配 Swap 条目，处理大页分裂等特殊情况。
 		if (folio_test_anon(folio) && folio_test_swapbacked(folio)) {
 			if (!folio_test_swapcache(folio)) {
 				if (!(sc->gfp_mask & __GFP_IO))
@@ -1326,6 +1261,7 @@ retry:
 					    split_folio_to_list(folio, folio_list))
 						goto activate_locked;
 				}
+				// 分配 Swap 空间
 				if (folio_alloc_swap(folio, __GFP_HIGH | __GFP_NOWARN)) {
 					int __maybe_unused order = folio_order(folio);
 
@@ -1345,26 +1281,12 @@ retry:
 					if (folio_alloc_swap(folio, __GFP_HIGH | __GFP_NOWARN))
 						goto activate_locked_split;
 				}
-				/*
-				 * Normally the folio will be dirtied in unmap because its
-				 * pte should be dirty. A special case is MADV_FREE page. The
-				 * page's pte could have dirty bit cleared but the folio's
-				 * SwapBacked flag is still set because clearing the dirty bit
-				 * and SwapBacked flag has no lock protected. For such folio,
-				 * unmap will not set dirty bit for it, so folio reclaim will
-				 * not write the folio out. This can cause data corruption when
-				 * the folio is swapped in later. Always setting the dirty flag
-				 * for the folio solves the problem.
-				 */
+				
+				// 确保脏标记
 				folio_mark_dirty(folio);
 			}
 		}
 
-		/*
-		 * If the folio was split above, the tail pages will make
-		 * their own pass through this function and be accounted
-		 * then.
-		 */
 		if ((nr_pages > 1) && !folio_test_large(folio)) {
 			sc->nr_scanned -= (nr_pages - 1);
 			nr_pages = 1;
@@ -1380,54 +1302,27 @@ retry:
 
 			if (folio_test_pmd_mappable(folio))
 				flags |= TTU_SPLIT_HUGE_PMD;
-			/*
-			 * Without TTU_SYNC, try_to_unmap will only begin to
-			 * hold PTL from the first present PTE within a large
-			 * folio. Some initial PTEs might be skipped due to
-			 * races with parallel PTE writes in which PTEs can be
-			 * cleared temporarily before being written new present
-			 * values. This will lead to a large folio is still
-			 * mapped while some subpages have been partially
-			 * unmapped after try_to_unmap; TTU_SYNC helps
-			 * try_to_unmap acquire PTL from the first PTE,
-			 * eliminating the influence of temporary PTE values.
-			 */
+
 			if (folio_test_large(folio))
 				flags |= TTU_SYNC;
 
-			try_to_unmap(folio, flags);
+			// 解映射（Unmapping）：解除 PTE/PMD 映射，确保页可回收。
+			try_to_unmap(folio, flags); // 解除物理内存映射
 			if (folio_mapped(folio)) {
 				stat->nr_unmap_fail += nr_pages;
 				if (!was_swapbacked &&
 				    folio_test_swapbacked(folio))
 					stat->nr_lazyfree_fail += nr_pages;
-				goto activate_locked;
+				goto activate_locked; // 失败则激活
 			}
 		}
 
-		/*
-		 * Folio is unmapped now so it cannot be newly pinned anymore.
-		 * No point in trying to reclaim folio if it is pinned.
-		 * Furthermore we don't want to reclaim underlying fs metadata
-		 * if the folio is pinned and thus potentially modified by the
-		 * pinning process as that may upset the filesystem.
-		 */
 		if (folio_maybe_dma_pinned(folio))
 			goto activate_locked;
 
 		mapping = folio_mapping(folio);
+		//  脏页回写（Pageout）
 		if (folio_test_dirty(folio)) {
-			/*
-			 * Only kswapd can writeback filesystem folios
-			 * to avoid risk of stack overflow. But avoid
-			 * injecting inefficient single-folio I/O into
-			 * flusher writeback as much as possible: only
-			 * write folios when we've encountered many
-			 * dirty folios, and when we've already scanned
-			 * the rest of the LRU for clean folios and see
-			 * the same dirty folios again (with the reclaim
-			 * flag set).
-			 */
 			if (folio_is_file_lru(folio) &&
 			    (!current_is_kswapd() ||
 			     !folio_test_reclaim(folio) ||
@@ -1452,27 +1347,18 @@ retry:
 			if (!sc->may_writepage)
 				goto keep_locked;
 
-			/*
-			 * Folio is dirty. Flush the TLB if a writable entry
-			 * potentially exists to avoid CPU writes after I/O
-			 * starts and then write it out here.
-			 */
 			try_to_unmap_flush_dirty();
+			// pageout() 负责将脏页写入磁盘或 Swap。
 			switch (pageout(folio, mapping, &plug, folio_list)) {
-			case PAGE_KEEP:
+			case PAGE_KEEP:    // 保留
 				goto keep_locked;
-			case PAGE_ACTIVATE:
-				/*
-				 * If shmem folio is split when writeback to swap,
-				 * the tail pages will make their own pass through
-				 * this function and be accounted then.
-				 */
+			case PAGE_ACTIVATE:// 激活
 				if (nr_pages > 1 && !folio_test_large(folio)) {
 					sc->nr_scanned -= (nr_pages - 1);
 					nr_pages = 1;
 				}
 				goto activate_locked;
-			case PAGE_SUCCESS:
+			case PAGE_SUCCESS: // 回写成功
 				if (nr_pages > 1 && !folio_test_large(folio)) {
 					sc->nr_scanned -= (nr_pages - 1);
 					nr_pages = 1;
@@ -1484,10 +1370,6 @@ retry:
 				if (folio_test_dirty(folio))
 					goto keep;
 
-				/*
-				 * A synchronous write - probably a ramdisk.  Go
-				 * ahead and try to reclaim the folio.
-				 */
 				if (!folio_trylock(folio))
 					goto keep;
 				if (folio_test_dirty(folio) ||
@@ -1500,30 +1382,10 @@ retry:
 			}
 		}
 
-		/*
-		 * If the folio has buffers, try to free the buffer
-		 * mappings associated with this folio. If we succeed
-		 * we try to free the folio as well.
-		 *
-		 * We do this even if the folio is dirty.
-		 * filemap_release_folio() does not perform I/O, but it
-		 * is possible for a folio to have the dirty flag set,
-		 * but it is actually clean (all its buffers are clean).
-		 * This happens if the buffers were written out directly,
-		 * with submit_bh(). ext3 will do this, as well as
-		 * the blockdev mapping.  filemap_release_folio() will
-		 * discover that cleanness and will drop the buffers
-		 * and mark the folio clean - it can be freed.
-		 *
-		 * Rarely, folios can have buffers and no ->mapping.
-		 * These are the folios which were not successfully
-		 * invalidated in truncate_cleanup_folio().  We try to
-		 * drop those buffers here and if that worked, and the
-		 * folio is no longer mapped into process address space
-		 * (refcount == 1) it can be freed.  Otherwise, leave
-		 * the folio on the LRU so it is swappable.
-		 */
+		// 文件缓存释放
+		// 尝试释放文件关联的缓存（如 ext4 的 buffer_head）。
 		if (folio_needs_release(folio)) {
+			// 释放 Buffer 缓存
 			if (!filemap_release_folio(folio, sc->gfp_mask))
 				goto activate_locked;
 			if (!mapping && folio_ref_count(folio) == 1) {
@@ -1531,13 +1393,6 @@ retry:
 				if (folio_put_testzero(folio))
 					goto free_it;
 				else {
-					/*
-					 * rare race with speculative reference.
-					 * the speculative reference will free
-					 * this folio shortly, so we may
-					 * increment nr_reclaimed here (and
-					 * leave it off the LRU).
-					 */
 					nr_reclaimed += nr_pages;
 					continue;
 				}
@@ -1548,14 +1403,6 @@ retry:
 			/* follow __remove_mapping for reference */
 			if (!folio_ref_freeze(folio, 1))
 				goto keep_locked;
-			/*
-			 * The folio has only one reference left, which is
-			 * from the isolation. After the caller puts the
-			 * folio back on the lru and drops the reference, the
-			 * folio will be freed anyway. It doesn't matter
-			 * which lru it goes on. So we don't bother checking
-			 * the dirty flag here.
-			 */
 			count_vm_events(PGLAZYFREED, nr_pages);
 			count_memcg_folio_events(folio, PGLAZYFREED, nr_pages);
 		} else if (!mapping || !__remove_mapping(mapping, folio, true,
@@ -1564,25 +1411,19 @@ retry:
 
 		folio_unlock(folio);
 free_it:
-		/*
-		 * Folio may get swapped out as a whole, need to account
-		 * all pages in it.
-		 */
-		nr_reclaimed += nr_pages;
+		nr_reclaimed += nr_pages;      // 更新回收计数
 
 		folio_unqueue_deferred_split(folio);
+		// 加入释放批次
 		if (folio_batch_add(&free_folios, folio) == 0) {
 			mem_cgroup_uncharge_folios(&free_folios);
 			try_to_unmap_flush();
+			// 最终通过 free_unref_folios() 批量释放物理页。
 			free_unref_folios(&free_folios);
 		}
 		continue;
 
 activate_locked_split:
-		/*
-		 * The tail pages that are failed to add into swap cache
-		 * reach here.  Fixup nr_scanned and nr_pages.
-		 */
 		if (nr_pages > 1) {
 			sc->nr_scanned -= (nr_pages - 1);
 			nr_pages = 1;
@@ -1609,48 +1450,35 @@ keep:
 	/* 'folio_list' is always empty here */
 
 	/* Migrate folios selected for demotion */
-	nr_demoted = demote_folio_list(&demote_folios, pgdat);
+	nr_demoted = demote_folio_list(&demote_folios, pgdat); // 执行降级
 	nr_reclaimed += nr_demoted;
 	stat->nr_demoted += nr_demoted;
-	/* Folios that could not be demoted are still in @demote_folios */
+	// 降级失败且非主动回收时，重试回收而非降级。
 	if (!list_empty(&demote_folios)) {
-		/* Folios which weren't demoted go back on @folio_list */
 		list_splice_init(&demote_folios, folio_list);
 
-		/*
-		 * goto retry to reclaim the undemoted folios in folio_list if
-		 * desired.
-		 *
-		 * Reclaiming directly from top tier nodes is not often desired
-		 * due to it breaking the LRU ordering: in general memory
-		 * should be reclaimed from lower tier nodes and demoted from
-		 * top tier nodes.
-		 *
-		 * However, disabling reclaim from top tier nodes entirely
-		 * would cause ooms in edge scenarios where lower tier memory
-		 * is unreclaimable for whatever reason, eg memory being
-		 * mlocked or too hot to reclaim. We can disable reclaim
-		 * from top tier nodes in proactive reclaim though as that is
-		 * not real memory pressure.
-		 */
 		if (!sc->proactive) {
 			do_demote_pass = false;
-			goto retry;
+			goto retry;            // 未成功则重试
 		}
 	}
 
+	// stat->nr_activate：激活的页数
 	pgactivate = stat->nr_activate[0] + stat->nr_activate[1];
 
-	mem_cgroup_uncharge_folios(&free_folios);
+	// 资源释放与统计
+	mem_cgroup_uncharge_folios(&free_folios); // 解除 memcg 计数
 	try_to_unmap_flush();
-	free_unref_folios(&free_folios);
+	free_unref_folios(&free_folios);          // 释放物理页
 
-	list_splice(&ret_folios, folio_list);
+	list_splice(&ret_folios, folio_list);     // 剩余页放回 LRU
+	// PGACTIVATE 事件计数
 	count_vm_events(PGACTIVATE, pgactivate);
 
 	if (plug)
 		swap_write_unplug(plug);
-	return nr_reclaimed;
+	// nr_reclaimed：实际回收的页数
+	return nr_reclaimed;                      // 返回回收页数
 }
 
 unsigned int reclaim_clean_pages_from_list(struct zone *zone,
