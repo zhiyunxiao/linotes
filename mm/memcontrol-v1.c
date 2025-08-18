@@ -319,85 +319,97 @@ static int mem_cgroup_soft_reclaim(struct mem_cgroup *root_memcg,
 	return total;
 }
 
+// 在特定 NUMA 节点上执行 memcg 软限制回收
+// pgdat: NUMA 节点数据结构指针
+// order: 内存申请阶数（仅支持 order=0）
+// gfp_mask: 内存分配标志
+// total_scanned: 输出扫描页面总数
+// 返回值：成功回收的页面数量
 unsigned long memcg1_soft_limit_reclaim(pg_data_t *pgdat, int order,
 					    gfp_t gfp_mask,
 					    unsigned long *total_scanned)
 {
+	// nr_reclaimed: 累计回收页数
 	unsigned long nr_reclaimed = 0;
+	// mz: 当前处理的 memcg_per_node
+	// next_mz: 下一个待处理的 memcg
 	struct mem_cgroup_per_node *mz, *next_mz = NULL;
+	// reclaimed: 单次回收页数
 	unsigned long reclaimed;
+	// loop: 循环计数器（防死循环）
 	int loop = 0;
+	// mctz: 当前节点的 memcg 红黑树
 	struct mem_cgroup_tree_per_node *mctz;
+	// excess: memcg 超出软限制的大小
 	unsigned long excess;
 
+	// 新特性检查：如果启用新一代 LRU 算法，暂不支持软限制回收
 	if (lru_gen_enabled())
 		return 0;
 
+	// 功能限制：软限制回收仅支持单页分配（order=0），高阶分配直接跳过
 	if (order > 0)
 		return 0;
 
+	// 获取数据结构：根据节点 ID 获取对应的 memcg 红黑树结构
+	// 背景知识：memcg 软限制使用红黑树按超出大小排序管理超限 memcg
 	mctz = soft_limit_tree.rb_tree_per_node[pgdat->node_id];
 
-	/*
-	 * Do not even bother to check the largest node if the root
-	 * is empty. Do it lockless to prevent lock bouncing. Races
-	 * are acceptable as soft limit is best effort anyway.
-	 */
+	// 空树检查：如果没有 memcg 超限或树为空，直接返回 0（无需回收）
 	if (!mctz || RB_EMPTY_ROOT(&mctz->rb_root))
 		return 0;
 
-	/*
-	 * This loop can run a while, specially if mem_cgroup's continuously
-	 * keep exceeding their soft limit and putting the system under
-	 * pressure
-	 */
+	// 主循环开始：
 	do {
-		if (next_mz)
+		if (next_mz)			// 如果有下一个 memcg，直接使用
 			mz = next_mz;
-		else
+		else					// 否则获取超限最严重的 memcg（树中最大值）
 			mz = mem_cgroup_largest_soft_limit_node(mctz);
-		if (!mz)
+		if (!mz)				// 如果没有任何超限 memcg，跳出循环
 			break;
 
+		// 核心回收操作：
+		// 1. 调用 mem_cgroup_soft_reclaim 尝试从当前 memcg 回收内存
+		// 2. 累计回收页数到 nr_reclaimed
 		reclaimed = mem_cgroup_soft_reclaim(mz->memcg, pgdat,
 						    gfp_mask, total_scanned);
 		nr_reclaimed += reclaimed;
-		spin_lock_irq(&mctz->lock);
+		spin_lock_irq(&mctz->lock);					// 树锁操作：加锁保护红黑树结构
 
-		/*
-		 * If we failed to reclaim anything from this memory cgroup
-		 * it is time to move on to the next cgroup
-		 */
+		// 后续处理：
+		// 1. 重置 next_mz
+		// 2. 如果本次未回收到内存，获取下一个最大超限 memcg
 		next_mz = NULL;
 		if (!reclaimed)
 			next_mz = __mem_cgroup_largest_soft_limit_node(mctz);
 
+		// 计算超限量：重新计算 memcg 超出软限制的大小（回收可能改变此值）
 		excess = soft_limit_excess(mz->memcg);
-		/*
-		 * One school of thought says that we should not add
-		 * back the node to the tree if reclaim returns 0.
-		 * But our reclaim could return 0, simply because due
-		 * to priority we are exposing a smaller subset of
-		 * memory to reclaim from. Consider this as a longer
-		 * term TODO.
-		 */
-		/* If excess == 0, no tree ops */
+
+		// 树结构更新：
+		// 1. 将当前 memcg 按新超限量重新插入红黑树
 		__mem_cgroup_insert_exceeded(mz, mctz, excess);
+		// 2. 释放树锁
 		spin_unlock_irq(&mctz->lock);
+
+		// 资源释放：减少 memcg 的引用计数
 		css_put(&mz->memcg->css);
+		// 循环计数：增加循环次数，防止无限循环
 		loop++;
-		/*
-		 * Could not reclaim anything and there are no more
-		 * mem cgroups to try or we seem to be looping without
-		 * reclaiming anything.
-		 */
+
+		// 循环退出条件：
+		// 已回收到内存（nr_reclaimed > 0）
+		// 没有下一个可处理 memcg（next_mz == NULL）
+		// 超过最大循环次数（默认10次）
 		if (!nr_reclaimed &&
 			(next_mz == NULL ||
 			loop > MEM_CGROUP_MAX_SOFT_LIMIT_RECLAIM_LOOPS))
 			break;
 	} while (!nr_reclaimed);
+	// 资源清理：如果存在未处理的 next_mz，释放其引用计数
 	if (next_mz)
 		css_put(&next_mz->memcg->css);
+	// 返回结果：返回总共回收的页数
 	return nr_reclaimed;
 }
 
