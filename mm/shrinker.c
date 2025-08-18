@@ -368,99 +368,101 @@ static long add_nr_deferred(long nr, struct shrinker *shrinker,
 
 #define SHRINK_BATCH 128
 
+// 执行实际的 slab 收缩操作
+// shrinkctl：包含回收控制信息（gfp_mask、nid、memcg）
+// shrinker：具体的收缩器对象（包含回收方法）
+// priority：回收优先级（值越小表示压力越大）
 static unsigned long do_shrink_slab(struct shrink_control *shrinkctl,
 				    struct shrinker *shrinker, int priority)
 {
-	unsigned long freed = 0;
-	unsigned long long delta;
-	long total_scan;
-	long freeable;
-	long nr;
-	long new_nr;
+	unsigned long freed = 0;          // 已释放的页数
+	unsigned long long delta;         // 本次回收应扫描的增量
+	long total_scan;                  // 本次总共需扫描的对象数
+	long freeable;                    // 可回收的对象总数
+	long nr;                          // 延迟计数值
+	long new_nr;                      // 新的延迟计数值
 	long batch_size = shrinker->batch ? shrinker->batch
-					  : SHRINK_BATCH;
-	long scanned = 0, next_deferred;
+					  : SHRINK_BATCH;  // 每次扫描的批次大小
+	long scanned = 0, next_deferred;  // 已扫描对象数，延迟计数器
 
+	// 调用 shrinker 的 count_objects 方法获取可回收对象总数
+	// 实际执行如：super_cache_count（文件系统缓存），inode_lru_isolate（inode 缓存）
 	freeable = shrinker->count_objects(shrinker, shrinkctl);
+	// 如果没有可回收对象或特殊标记，直接返回
 	if (freeable == 0 || freeable == SHRINK_EMPTY)
 		return freeable;
 
-	/*
-	 * copy the current shrinker scan count into a local variable
-	 * and zero it so that other concurrent shrinker invocations
-	 * don't also do this scanning work.
-	 */
+	// 原子交换获取并重置 per-node/memcg 的延迟计数
+	// 统计上次回收未完成的扫描量，确保公平扫描
+	// nr_deferred 数组存储在 shrinker 结构中（per-node）
 	nr = xchg_nr_deferred(shrinker, shrinkctl);
 
+	// seeks 机制：评估对象回收成本（如磁盘I/O成本）
+	// 对于低I/O开销的缓存（如inode），积极回收
+	// 对于高I/O开销的缓存（如dentry），保守回收
+	// 计算方法：delta = (freeable/2^priority * 4) / seeks
 	if (shrinker->seeks) {
-		delta = freeable >> priority;
+		delta = freeable >> priority;  // 压力越大扫描越多
 		delta *= 4;
-		do_div(delta, shrinker->seeks);
+		do_div(delta, shrinker->seeks);  // 除以"查找成本"
 	} else {
-		/*
-		 * These objects don't require any IO to create. Trim
-		 * them aggressively under memory pressure to keep
-		 * them from causing refetches in the IO caches.
-		 */
-		delta = freeable / 2;
+		delta = freeable / 2;  // 无成本对象直接扫描半数
 	}
 
-	total_scan = nr >> priority;
-	total_scan += delta;
-	total_scan = min(total_scan, (2 * freeable));
+	// 平衡扫描量和回收效率
+	// 压力大时（priority小）：
+	// 1. 扫描更多延迟对象
+	// 2. 扫描更大的增量
+	// 保护机制：扫描量不超过对象总量的2倍
+	total_scan = nr >> priority;  // 延迟计数按优先级折算
+	total_scan += delta;          // 加上本次增量
+	total_scan = min(total_scan, (2 * freeable));  // 不超过两倍对象数
 
+	// 调试追踪：记录回收开始前的状态
 	trace_mm_shrink_slab_start(shrinker, shrinkctl, nr,
 				   freeable, delta, total_scan, priority);
 
-	/*
-	 * Normally, we should not scan less than batch_size objects in one
-	 * pass to avoid too frequent shrinker calls, but if the slab has less
-	 * than batch_size objects in total and we are really tight on memory,
-	 * we will try to reclaim all available objects, otherwise we can end
-	 * up failing allocations although there are plenty of reclaimable
-	 * objects spread over several slabs with usage less than the
-	 * batch_size.
-	 *
-	 * We detect the "tight on memory" situations by looking at the total
-	 * number of objects we want to scan (total_scan). If it is greater
-	 * than the total number of objects on slab (freeable), we must be
-	 * scanning at high prio and therefore should try to reclaim as much as
-	 * possible.
-	 */
+	// 当待扫描量 ≥ 批次大小，或待扫描量 ≥ 可回收量（内存极紧张）
 	while (total_scan >= batch_size ||
 	       total_scan >= freeable) {
 		unsigned long ret;
+		// 批处理优化：每次扫描不超过批次大小（默认128）
+		// 避免单次回收时间过长
 		unsigned long nr_to_scan = min(batch_size, total_scan);
 
+		// 准备扫描控制参数
 		shrinkctl->nr_to_scan = nr_to_scan;
 		shrinkctl->nr_scanned = nr_to_scan;
+
+		// 核心操作：调用 shrinker 的具体扫描方法
+		// 示例文件系统扫描器：super_cache_scan()，inode_lru_isolate()
 		ret = shrinker->scan_objects(shrinker, shrinkctl);
 		if (ret == SHRINK_STOP)
-			break;
-		freed += ret;
+			break;  // 提前终止扫描
 
-		count_vm_events(SLABS_SCANNED, shrinkctl->nr_scanned);
-		total_scan -= shrinkctl->nr_scanned;
-		scanned += shrinkctl->nr_scanned;
+		// 扫描过程中主动调度，避免卡顿
+		// 熔断机制：当扫描器遇到问题时可提前终止
+		freed += ret;  // 累计回收页数
 
-		cond_resched();
+		count_vm_events(SLABS_SCANNED, shrinkctl->nr_scanned);  // 更新统计
+		total_scan -= shrinkctl->nr_scanned;  // 更新剩余扫描量
+		scanned += shrinkctl->nr_scanned;  // 累计实际扫描量
+
+		cond_resched();  // 主动让出CPU
 	}
 
-	/*
-	 * The deferred work is increased by any new work (delta) that wasn't
-	 * done, decreased by old deferred work that was done now.
-	 *
-	 * And it is capped to two times of the freeable items.
-	 */
+	// 延迟计算算法：
+	// 1. 新延迟 = 旧延迟 + 本次增量 - 已扫描量
+	// 2. 保证非负且不超过对象总量的两倍
 	next_deferred = max_t(long, (nr + delta - scanned), 0);
 	next_deferred = min(next_deferred, (2 * freeable));
 
-	/*
-	 * move the unused scan count back into the shrinker in a
-	 * manner that handles concurrent updates.
-	 */
+	// 原子更新：将新延迟值写回 shrinker 结构
+	// 保障跨CPU核心的一致性
 	new_nr = add_nr_deferred(next_deferred, shrinker, shrinkctl);
 
+	// 记录回收结束事件（用于ftrace调试）
+	// 返回实际释放的内存页数
 	trace_mm_shrink_slab_end(shrinker, shrinkctl->nid, freed, nr, new_nr, total_scan);
 	return freed;
 }
@@ -611,66 +613,78 @@ static unsigned long shrink_slab_memcg(gfp_t gfp_mask, int nid,
  *
  * Returns the number of reclaimed slab objects.
  */
+// 入口函数，用于收缩所有注册的 shrinker 管理的 slab 缓存
+// gfp_mask: 内存分配标志，指定回收行为
+// nid: NUMA 节点 ID
+// memcg: 内存控制组指针
+// priority: 回收优先级 (值越小表示压力越大)
+// 返回值: 总共释放的内存量
 unsigned long shrink_slab(gfp_t gfp_mask, int nid, struct mem_cgroup *memcg,
 			  int priority)
 {
+	// ret: 单次 shrinker 收缩的返回值
+	// freed: 累计释放的页数
 	unsigned long ret, freed = 0;
+	// shrinker: 遍历 shrinker 列表的指针
 	struct shrinker *shrinker;
 
-	/*
-	 * The root memcg might be allocated even though memcg is disabled
-	 * via "cgroup_disable=memory" boot parameter.  This could make
-	 * mem_cgroup_is_root() return false, then just run memcg slab
-	 * shrink, but skip global shrink.  This may result in premature
-	 * oom.
-	 */
+	// 处理 memcg 禁用时的特殊情况,当通过启动参数禁用 memcg 时，根 memcg 可能仍存在,避免跳过全局回收导致过早 OOM
+	// 如果 memcg 启用且不是根 memcg
+	// 则调用 memcg 专用的收缩函数
+	// 直接返回不再执行全局收缩
 	if (!mem_cgroup_disabled() && !mem_cgroup_is_root(memcg))
 		return shrink_slab_memcg(gfp_mask, nid, memcg, priority);
 
-	/*
-	 * lockless algorithm of global shrink.
-	 *
-	 * In the unregistration setp, the shrinker will be freed asynchronously
-	 * via RCU after its refcount reaches 0. So both rcu_read_lock() and
-	 * shrinker_try_get() can be used to ensure the existence of the shrinker.
-	 *
-	 * So in the global shrink:
-	 *  step 1: use rcu_read_lock() to guarantee existence of the shrinker
-	 *          and the validity of the shrinker_list walk.
-	 *  step 2: use shrinker_try_get() to try get the refcount, if successful,
-	 *          then the existence of the shrinker can also be guaranteed,
-	 *          so we can release the RCU lock to do do_shrink_slab() that
-	 *          may sleep.
-	 *  step 3: *MUST* to reacquire the RCU lock before calling shrinker_put(),
-	 *          which ensures that neither this shrinker nor the next shrinker
-	 *          will be freed in the next traversal operation.
-	 *  step 4: do shrinker_put() paired with step 2 to put the refcount,
-	 *          if the refcount reaches 0, then wake up the waiter in
-	 *          shrinker_free() by calling complete().
-	 */
+	// 开始受 RCU 保护的临界区, 保证 shrinker 列表遍历期间不会被释放
 	rcu_read_lock();
+	// 遍历所有 shrinkers:
+	// 1. 使用 RCU-safe 方式遍历全局 shrinker_list
+	// 2. 处理每个注册的内存回收器
 	list_for_each_entry_rcu(shrinker, &shrinker_list, list) {
+		// 准备控制结构:
+		// 1. 创建传递参数的 shrink_control
+		// 2. 包含内存标志、节点 ID 和内存控制组
 		struct shrink_control sc = {
 			.gfp_mask = gfp_mask,
 			.nid = nid,
 			.memcg = memcg,
 		};
 
+		// 获取 shrinker 引用:
+		// 1. 尝试增加 shrinker 的引用计数
+		// 2. 如果失败(可能正在注销)，跳过此 shrinker
+		// 3. 保证后续操作期间 shrinker 不会被释放
 		if (!shrinker_try_get(shrinker))
 			continue;
 
+		// 释放 RCU 锁:
+		// 1. 允许在 do_shrink_slab 中睡眠
+		// 2. 因为已通过引用计数保护 shrinker
 		rcu_read_unlock();
 
+		// 执行实际收缩:
+		// 1. 调用 shrinker 的扫描函数
+		// 2. 可能阻塞/睡眠，因为已释放 RCU 锁
 		ret = do_shrink_slab(&sc, shrinker, priority);
+		// 处理特殊返回值:
+		// 1. SHRINK_EMPTY: 没有可回收对象
+		// 转换为 0 避免干扰统计
 		if (ret == SHRINK_EMPTY)
 			ret = 0;
+		// 累计释放量:统计所有 shrinker 释放的总页数
 		freed += ret;
 
+		// 重新加 RCU 锁:为下一轮遍历和 put 操作准备
 		rcu_read_lock();
+		// 释放 shrinker 引用:
+		// 1. 减少引用计数
+		// 2. 若计数归零则唤醒等待注销的进程
+		// 3. 与前面的 try_get 配对使用
 		shrinker_put(shrinker);
 	}
 
 	rcu_read_unlock();
+	// 避免长时间占用 CPU, 保证其他进程有机会运行
 	cond_resched();
 	return freed;
 }

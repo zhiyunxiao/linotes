@@ -1186,7 +1186,7 @@ retry:
 			stat->nr_unqueued_dirty += nr_pages;
 
 		if (writeback && folio_test_reclaim(folio))
-			stat->nr_congested += nr_pages;
+			stat->nr_congested += nr_pages; // 记录 因 I/O 阻塞而无法回收的页面数量
 
 		if (folio_test_writeback(folio)) {
 			mapping = folio_mapping(folio);
@@ -1194,7 +1194,7 @@ retry:
 			// Case 1：kswapd 遇高回写压力，立即激活。
 			if (current_is_kswapd() &&
 			    folio_test_reclaim(folio) &&
-			    test_bit(PGDAT_WRITEBACK, &pgdat->flags)) {
+			    test_bit(PGDAT_WRITEBACK, &pgdat->flags)) { // 内核设置此标志 → 表示节点上的页面正在被回写。
 				stat->nr_immediate += nr_pages;
 				goto activate_locked;
 
@@ -1252,10 +1252,7 @@ retry:
 					/* cannot split folio, skip it */
 					if (!can_split_folio(folio, 1, NULL))
 						goto activate_locked;
-					/*
-					 * Split partially mapped folios right away.
-					 * We can free the unmapped pages without IO.
-					 */
+
 					if (data_race(!list_empty(&folio->_deferred_list) &&
 					    folio_test_partially_mapped(folio)) &&
 					    split_folio_to_list(folio, folio_list))
@@ -1292,10 +1289,6 @@ retry:
 			nr_pages = 1;
 		}
 
-		/*
-		 * The folio is mapped into the page tables of one or more
-		 * processes. Try to unmap it here.
-		 */
 		if (folio_mapped(folio)) {
 			enum ttu_flags flags = TTU_BATCH_FLUSH;
 			bool was_swapbacked = folio_test_swapbacked(folio);
@@ -1327,12 +1320,6 @@ retry:
 			    (!current_is_kswapd() ||
 			     !folio_test_reclaim(folio) ||
 			     !test_bit(PGDAT_DIRTY, &pgdat->flags))) {
-				/*
-				 * Immediately reclaim when written back.
-				 * Similar in principle to folio_deactivate()
-				 * except we already have the folio isolated
-				 * and know it's dirty
-				 */
 				node_stat_mod_folio(folio, NR_VMSCAN_IMMEDIATE,
 						nr_pages);
 				folio_set_reclaim(folio);
