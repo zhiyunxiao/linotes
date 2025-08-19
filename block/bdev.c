@@ -91,14 +91,30 @@ static void kill_bdev(struct block_device *bdev)
 	truncate_inode_pages(mapping, 0);
 }
 
-/* Invalidate clean unused buffers and pagecache. */
+// 使块设备（block device）的缓存无效（清除页缓存）
 void invalidate_bdev(struct block_device *bdev)
 {
+    // 获取块设备的地址空间映射（address_space）
+    // 该结构管理页缓存（page cache）和磁盘数据的映射关系
 	struct address_space *mapping = bdev->bd_mapping;
 
+	// 检查页缓存中是否有缓存的页面
 	if (mapping->nrpages) {
+        // 步骤1：使缓冲区头的LRU（最近最少使用）缓存无效
+        // 确保内核的块I/O层缓存（buffer_head）被清除
 		invalidate_bh_lrus();
+
+        // 步骤2：排空所有CPU的LRU队列缓存
+        // 确保所有待加入LRU的页面被刷新到全局LRU列表
+        // （防止后续操作漏掉未同步的页面）
 		lru_add_drain_all();	/* make sure all lru add caches are flushed */
+
+        // 步骤3：清除地址空间的所有页缓存
+        // 参数说明：
+        //   mapping: 目标地址空间
+        //   0: 起始偏移（从0开始）
+        //   -1: 结束偏移（表示到文件尾）
+        // 这会移除所有未被引用的缓存页；锁定的或正在使用的页面会保留
 		invalidate_mapping_pages(mapping, 0, -1);
 	}
 }

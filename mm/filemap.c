@@ -955,35 +955,62 @@ error:
 }
 ALLOW_ERROR_INJECTION(__filemap_add_folio, ERRNO);
 
+// 将 folio 添加到文件映射的页缓存中
+// mapping: 文件对应的地址空间结构(address_space)
+// folio: 要添加的内存页容器
+// index: 文件中的页偏移量
+// gfp: 内存分配标志
 int filemap_add_folio(struct address_space *mapping, struct folio *folio,
 				pgoff_t index, gfp_t gfp)
 {
-	void *shadow = NULL;
-	int ret;
+	void *shadow = NULL;	// 用于工作集检测的影子条目指针
+	int ret;				// 操作结果返回码
 
+	// 内存控制组计费：
+	// 1. 将 folio 的内存使用计入 mem_cgroup
+	// 2. 如果 cgroup 超出内存限制可能失败
+	// 3. NULL 表示无特定任务上下文
 	ret = mem_cgroup_charge(folio, NULL, gfp);
 	if (ret)
-		return ret;
+		return ret;			// 错误处理：如果内存计费失败，直接返回错误码
 
+	// 设置页面锁：
+	// 1. 标记 folio 为锁定状态，防止并发访问
+	// 2. 在页缓存操作期间保护页面完整性
 	__folio_set_locked(folio);
+
+	// 核心添加操作：
+	// 1. 调用内部函数实现页缓存添加
+	// 2. shadow 参数用于工作集检测
+	// 3. 可能返回的错误包括：
+	// 		-EEXIST：页已存在缓存中
+	// 		-ENOMEM：内存不足
 	ret = __filemap_add_folio(mapping, folio, index, gfp, &shadow);
+	// 失败处理：
+	// 1. 撤销 mem_cgroup 计费
+	// 2. 清除页锁定状态
+	// 3. 返回错误码给调用者
 	if (unlikely(ret)) {
 		mem_cgroup_uncharge(folio);
 		__folio_clear_locked(folio);
 	} else {
-		/*
-		 * The folio might have been evicted from cache only
-		 * recently, in which case it should be activated like
-		 * any other repeatedly accessed folio.
-		 * The exception is folios getting rewritten; evicting other
-		 * data from the working set, only to cache data that will
-		 * get overwritten with something else, is a waste of memory.
-		 */
+		// 状态校验：
+		// 1. 警告并确认页面不是活动状态
+		// 2. 新添加到缓存的页应为非活动状态
 		WARN_ON_ONCE(folio_test_active(folio));
+		// 工作集检测：
+		// 条件 1：不是写分配(__GFP_WRITE)
+		// 条件 2：存在影子条目
+		// 调用工作集 refault 逻辑，更新页面活跃度
 		if (!(gfp & __GFP_WRITE) && shadow)
 			workingset_refault(folio, shadow);
+
+		// LRU 链表管理：
+		// 将新页面添加到 LRU 链表
+		// 使页面可见于页面回收机制
 		folio_add_lru(folio);
 	}
+	// 返回结果：操作状态码
 	return ret;
 }
 EXPORT_SYMBOL_GPL(filemap_add_folio);
