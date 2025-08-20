@@ -681,15 +681,33 @@ void lru_add_drain_cpu(int cpu)
  *
  * Context: Caller holds a reference on the folio.
  */
+// 功能：向 VM 暗示该文件页是良好的回收候选
+// 典型场景：当因页脏/写回导致失效失败时调用
+// 前置条件：调用者持有页引用（防止操作中被释放）
+// 参数：folio：要解除活动的文件页 (struct folio *)
 void deactivate_file_folio(struct folio *folio)
 {
-	/* Deactivating an unevictable folio will not accelerate reclaim */
+	// 检查条件：folio_test_unevictable()
+	// 检测页是否在不可回收链表 (UNEVICTABLE LRU)
+	// 处理逻辑：
+	// 若页被标记为不可回收 → 直接返回
+	// 原因：不可回收页不会被内存回收机制处理，解除活动无意义
 	if (folio_test_unevictable(folio))
 		return;
 
+	// 多代LRU优化：
+	// lru_gen_enabled()：检查是否启用多代LRU机制
+	// lru_gen_clear_refs(folio)：在多代LRU中清除访问标记
+	// 处理逻辑：
+	// 若使用多代LRU且已处理引用 → 直接返回（避免重复操作）
+	// 机制：多代LRU通过年龄跟踪自动管理页活跃度
 	if (lru_gen_enabled() && lru_gen_clear_refs(folio))
 		return;
 
+	// 操作效果：
+	// 将页加入批处理队列
+	// 迁移至 LRU_INACTIVE_FILE 链表尾部
+	// 标记为"非活动"，提升回收优先级
 	folio_batch_add_and_move(folio, lru_deactivate_file, true);
 }
 
