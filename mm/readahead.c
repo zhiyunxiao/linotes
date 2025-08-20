@@ -204,98 +204,93 @@ static struct folio *ractl_alloc_folio(struct readahead_control *ractl,
  * Context: File is referenced by caller.  Mutexes may be held by caller.
  * May sleep, but will not reenter filesystem to reclaim memory.
  */
+// 内核预读机制的核心实现，负责高效地将一批页面添加到页缓存中并进行预读
 void page_cache_ra_unbounded(struct readahead_control *ractl,
 		unsigned long nr_to_read, unsigned long lookahead_size)
 {
-	struct address_space *mapping = ractl->mapping;
-	unsigned long index = readahead_index(ractl);
-	gfp_t gfp_mask = readahead_gfp_mask(mapping);
+	// 从控制结构获取地址空间和索引
+	struct address_space *mapping = ractl->mapping;		// mapping: 文件所属的地址空间
+	unsigned long index = readahead_index(ractl);		// index: 当前读取位置索引
+
+	// 获取GFP掩码和最小页面数量
+	gfp_t gfp_mask = readahead_gfp_mask(mapping);		// gfp_mask: 内存分配标志
 	unsigned long mark = ULONG_MAX, i = 0;
-	unsigned int min_nrpages = mapping_min_folio_nrpages(mapping);
+	unsigned int min_nrpages = mapping_min_folio_nrpages(mapping);		// min_nrpages: 预读的最小页面数（通常1或大页支持）
 
-	/*
-	 * Partway through the readahead operation, we will have added
-	 * locked pages to the page cache, but will not yet have submitted
-	 * them for I/O.  Adding another page may need to allocate memory,
-	 * which can trigger memory reclaim.  Telling the VM we're in
-	 * the middle of a filesystem operation will cause it to not
-	 * touch file-backed pages, preventing a deadlock.  Most (all?)
-	 * filesystems already specify __GFP_NOFS in their mapping's
-	 * gfp_mask, but let's be explicit here.
-	 */
-	unsigned int nofs = memalloc_nofs_save();
+	// 防止内存回收死锁
+	unsigned int nofs = memalloc_nofs_save();		// memalloc_nofs_save(): 设置内存分配标志，防止文件系统操作中的回收死锁
 
-	filemap_invalidate_lock_shared(mapping);
-	index = mapping_align_index(mapping, index);
+	// 获取共享锁保护地址空间
+	filemap_invalidate_lock_shared(mapping);		// filemap_invalidate_lock_shared(): 获取轻量级共享锁，允许多个预读并行
 
-	/*
-	 * As iterator `i` is aligned to min_nrpages, round_up the
-	 * difference between nr_to_read and lookahead_size to mark the
-	 * index that only has lookahead or "async_region" to set the
-	 * readahead flag.
-	 */
+	// 对齐索引到最小页面边界
+	index = mapping_align_index(mapping, index);	// mapping_align_index(): 将索引对齐到最小页面边界，支持大页
+
+	// 计算标记页面位置
 	if (lookahead_size <= nr_to_read) {
 		unsigned long ra_folio_index;
 
+		// 计算标记页面索引
 		ra_folio_index = round_up(readahead_index(ractl) +
 					  nr_to_read - lookahead_size,
 					  min_nrpages);
+		// 相对位置标记
 		mark = ra_folio_index - index;
 	}
+	// 更新实际需处理页面数
 	nr_to_read += readahead_index(ractl) - index;
 	ractl->_index = index;
 
-	/*
-	 * Preallocate as many pages as we will need.
-	 */
+	// 批量预分配页面
 	while (i < nr_to_read) {
+		// 检查页面是否已在缓存
 		struct folio *folio = xa_load(&mapping->i_pages, index + i);
 		int ret;
 
+		// 页面已存在时的处理
 		if (folio && !xa_is_value(folio)) {
-			/*
-			 * Page already present?  Kick off the current batch
-			 * of contiguous pages before continuing with the
-			 * next batch.  This page may be the one we would
-			 * have intended to mark as Readahead, but we don't
-			 * have a stable reference to this page, and it's
-			 * not worth getting one just for that.
-			 */
+			// 提交已添加的批次
 			read_pages(ractl);
+			// 跳过已有页面区域
 			ractl->_index += min_nrpages;
 			i = ractl->_index + ractl->_nr_pages - index;
 			continue;
 		}
 
-		folio = ractl_alloc_folio(ractl, gfp_mask,
+		// 为新页面分配内存
+		folio = ractl_alloc_folio(ractl, gfp_mask,		// ractl_alloc_folio：分配物理页帧
 					mapping_min_folio_order(mapping));
 		if (!folio)
-			break;
+			break;	// 内存不足时停止
 
-		ret = filemap_add_folio(mapping, folio, index + i, gfp_mask);
+		// 将新页面加入页缓存
+		ret = filemap_add_folio(mapping, folio, index + i, gfp_mask);	// filemap_add_folio：将页添加到地址空间
+		// 添加失败处理
 		if (ret < 0) {
 			folio_put(folio);
-			if (ret == -ENOMEM)
-				break;
+			if (ret == -ENOMEM)		// -ENOMEM：终止预读
+				break;	// 内存不足退出
+			// 其他错误：提交当前批次后跳过错误区域
 			read_pages(ractl);
 			ractl->_index += min_nrpages;
 			i = ractl->_index + ractl->_nr_pages - index;
 			continue;
 		}
+		// 设置预读标志
 		if (i == mark)
-			folio_set_readahead(folio);
-		ractl->_workingset |= folio_test_workingset(folio);
-		ractl->_nr_pages += min_nrpages;
+			folio_set_readahead(folio);	// folio_set_readahead(): 设置预读标志，影响回收优先级
+		// 更新工作集标记
+		ractl->_workingset |= folio_test_workingset(folio);	// workingset标记：表明页面属于工作集，避免过早回收
+		// 更新控制状态
+		ractl->_nr_pages += min_nrpages;	// _nr_pages更新：跟踪已添加但未读的页面数
 		i += min_nrpages;
 	}
 
-	/*
-	 * Now start the IO.  We ignore I/O errors - if the folio is not
-	 * uptodate then the caller will launch read_folio again, and
-	 * will then handle the error.
-	 */
+	// 提交最终批次IO请求
 	read_pages(ractl);
+	// 释放共享锁
 	filemap_invalidate_unlock_shared(mapping);
+	// 恢复内存分配上下文
 	memalloc_nofs_restore(nofs);
 }
 EXPORT_SYMBOL_GPL(page_cache_ra_unbounded);
