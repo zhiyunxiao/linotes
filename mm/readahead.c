@@ -301,24 +301,58 @@ EXPORT_SYMBOL_GPL(page_cache_ra_unbounded);
  * behaviour which would occur if page allocations are causing VM writeback.
  * We really don't want to intermingle reads and writes like that.
  */
+// 实现文件预读(readahead)的核心逻辑
+// ractl：预读控制结构（包含文件映射、位置等信息）
+// nr_to_read：建议预读的页数
+// lookahead_size：预读窗口大小（用于预测性预读）
 static void do_page_cache_ra(struct readahead_control *ractl,
 		unsigned long nr_to_read, unsigned long lookahead_size)
 {
+	// 功能：从文件映射结构获取关联的 inode
+	// 说明：mapping->host 指向拥有该地址空间的文件 inode
 	struct inode *inode = ractl->mapping->host;
+
+	// 功能：获取当前预读起始页索引
+	// 说明：readahead_index() 从预读控制结构中提取起始偏移对应的页号
 	unsigned long index = readahead_index(ractl);
+
+	// 功能：安全读取文件大小
+	// 说明：i_size_read() 使用内存屏障保证在 32 位系统上原子读取 64 位文件大小
 	loff_t isize = i_size_read(inode);
 	pgoff_t end_index;	/* The last page we want to read */
 
+	// 功能：检查空文件
+	// 说明：文件大小为 0 时直接返回，避免无效操作
 	if (isize == 0)
 		return;
 
+	// 功能：计算文件最后一个有效页的索引
+	// 计算逻辑：
+	//     文件大小 - 1 → 获取最后字节位置
+	//     >> PAGE_SHIFT → 转换为页索引（相当于除以页大小）
 	end_index = (isize - 1) >> PAGE_SHIFT;
+
+	// 功能：检查起始位置是否越界
+	// 说明：如果请求的页索引已超过文件末尾，直接返回（如访问结尾空洞区域）
 	if (index > end_index)
 		return;
-	/* Don't read past the page containing the last byte of the file */
+
+	// 功能：调整预读数量防止越界
+	// 计算逻辑：
+	// end_index - index → 剩余有效页数
+	// +1 → 包含起始页的闭区间计算（如索引 10-12 共 3 页）
+	// 示例：文件只有 10 页时请求预读 100 页 → 实际只读 10 页
 	if (nr_to_read > end_index - index)
 		nr_to_read = end_index - index + 1;
 
+	// 功能：执行实际预读操作
+	// 核心步骤（在 page_cache_ra_unbounded() 中实现）：
+	// 1. 预分配页：通过 page_cache_alloc() 批量分配物理页
+	// 2. 提交 I/O：调用 read_pages() 提交异步读请求
+	// 3. 更新状态：记录预读位置到 ractl 控制结构
+	// 优化目的：
+	// 1. 先批量分配页再提交 I/O → 避免内存回收与 I/O 的竞争
+	// 2. 分离读/写操作 → 防止读写混合导致的性能下降
 	page_cache_ra_unbounded(ractl, nr_to_read, lookahead_size);
 }
 

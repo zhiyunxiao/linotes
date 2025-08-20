@@ -2599,71 +2599,96 @@ static int filemap_readahead(struct kiocb *iocb, struct file *file,
 	return 0;
 }
 
+// 同步/异步文件读取获取或创建文件页
+// iocb：I/O 控制块（包含文件指针、位置、标志）
+// count：请求读取的字节数
+// fbatch：页批处理结构（存放获取的页）
+// need_uptodate：是否要求页数据必须最新
 static int filemap_get_pages(struct kiocb *iocb, size_t count,
 		struct folio_batch *fbatch, bool need_uptodate)
 {
 	struct file *filp = iocb->ki_filp;
 	struct address_space *mapping = filp->f_mapping;
-	pgoff_t index = iocb->ki_pos >> PAGE_SHIFT;
-	pgoff_t last_index;
+	pgoff_t index = iocb->ki_pos >> PAGE_SHIFT;		// index：当前文件位置对应的页索引
+	pgoff_t last_index;		// last_index：读取范围结束页索引
 	struct folio *folio;
 	unsigned int flags;
 	int err = 0;
 
-	/* "last_index" is the index of the page beyond the end of the read */
+	// 计算逻辑：(iocb->ki_pos + count + PAGE_SIZE - 1) / PAGE_SIZE 确保包含所有部分覆盖的页
 	last_index = DIV_ROUND_UP(iocb->ki_pos + count, PAGE_SIZE);
-retry:
+retry: 	// 用途：处理文件截断等重试场景
+	// 安全机制：若进程收到致命信号（如 SIGKILL），返回中断错误
 	if (fatal_signal_pending(current))
 		return -EINTR;
 
+	// 核心操作：从页缓存获取 [index, last_index-1] 范围内的有效页 结果存储到 fbatch
 	filemap_get_read_batch(mapping, index, last_index - 1, fbatch);
+	// 情景：页缓存未命中（请求的页不在内存中）
 	if (!folio_batch_count(fbatch)) {
+		// 初始化预读控制  结构体：struct readahead_control  初始化文件预读上下文
 		DEFINE_READAHEAD(ractl, filp, &filp->f_ra, mapping, index);
 
-		if (iocb->ki_flags & IOCB_NOIO)
+		if (iocb->ki_flags & IOCB_NOIO)		// IOCB_NOIO：禁止发起 I/O → 返回重试错误
 			return -EAGAIN;
-		if (iocb->ki_flags & IOCB_NOWAIT)
+		if (iocb->ki_flags & IOCB_NOWAIT)	// IOCB_NOWAIT：非阻塞模式 → 禁止内存回收 I/O
 			flags = memalloc_noio_save();
-		if (iocb->ki_flags & IOCB_DONTCACHE)
+		if (iocb->ki_flags & IOCB_DONTCACHE)	// IOCB_DONTCACHE：设置预读丢弃标志
 			ractl.dropbehind = 1;
+		
+		// 执行同步预读 作用：
+		// 1. 触发同步预读操作，填充页缓存
+		// 2. 参数 last_index - index 为待预读页数
 		page_cache_sync_ra(&ractl, last_index - index);
+		// 恢复内存标志 : 解除内存分配限制（仅限 IOCB_NOWAIT 模式）
 		if (iocb->ki_flags & IOCB_NOWAIT)
 			memalloc_noio_restore(flags);
+		// 重试获取页
+		// 二次尝试：预读后再次尝试从缓存获取页
 		filemap_get_read_batch(mapping, index, last_index - 1, fbatch);
 	}
+	// 处理预读失败
+	// 创建新页：缓存仍无数据 → 创建空白页
 	if (!folio_batch_count(fbatch)) {
 		err = filemap_create_folio(iocb, fbatch);
-		if (err == AOP_TRUNCATED_PAGE)
+		if (err == AOP_TRUNCATED_PAGE)	// AOP_TRUNCATED_PAGE：文件被截断 → 跳回 retry 重新计算范围
 			goto retry;
 		return err;
 	}
 
+	// 检查预读提示
+	// 触发异步预读：若页标记为 readahead → 启动异步预读 优化大文件顺序读取性能
 	folio = fbatch->folios[folio_batch_count(fbatch) - 1];
 	if (folio_test_readahead(folio)) {
 		err = filemap_readahead(iocb, filp, mapping, folio, last_index);
 		if (err)
 			goto err;
 	}
+	// 处理非最新页
 	if (!folio_test_uptodate(folio)) {
-		if ((iocb->ki_flags & IOCB_WAITQ) &&
+		if ((iocb->ki_flags & IOCB_WAITQ) &&	// IOCB_WAITQ 优化：批量多页处理时，设置 NOWAIT 减少阻塞
 		    folio_batch_count(fbatch) > 1)
 			iocb->ki_flags |= IOCB_NOWAIT;
+		// 核心操作：filemap_update_page()
+		// 确保页数据最新（可能发起同步 I/O）
 		err = filemap_update_page(iocb, mapping, count, folio,
 					  need_uptodate);
 		if (err)
 			goto err;
 	}
 
+	// 记录追踪事件
+	// 调试支持：内核事件跟踪（通过 ftrace 可见）
 	trace_mm_filemap_get_pages(mapping, index, last_index - 1);
 	return 0;
-err:
+err: // 错误分支处理：
 	if (err < 0)
-		folio_put(folio);
+		folio_put(folio);	// 释放问题页（folio_put）
 	if (likely(--fbatch->nr))
-		return 0;
+		return 0;	// 若批次中还有其他页 → 返回部分成功（0）
 	if (err == AOP_TRUNCATED_PAGE)
-		goto retry;
-	return err;
+		goto retry;	// 若文件被截断 → 跳回 retry 重试
+	return err;		// 其他错误直接返回
 }
 
 static inline bool pos_same_folio(loff_t pos1, loff_t pos2, struct folio *folio)
