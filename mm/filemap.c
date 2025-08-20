@@ -2723,94 +2723,95 @@ static void filemap_end_dropbehind_read(struct folio *folio)
  * the caller.  If an error happens before any bytes are copied, returns
  * a negative error number.
  */
+// 文件读取核心函数
+// iocb：I/O 控制块（文件位置/标志）
+// iter：用户空间 I/O 缓冲区描述
+// already_read：先前已读取的字节数
 ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 		ssize_t already_read)
 {
 	struct file *filp = iocb->ki_filp;
-	struct file_ra_state *ra = &filp->f_ra;
+	struct file_ra_state *ra = &filp->f_ra;       // 预读状态
 	struct address_space *mapping = filp->f_mapping;
-	struct inode *inode = mapping->host;
-	struct folio_batch fbatch;
+	struct inode *inode = mapping->host;           // 文件inode
+	struct folio_batch fbatch;                     // 页批处理结构
 	int i, error = 0;
 	bool writably_mapped;
 	loff_t isize, end_offset;
-	loff_t last_pos = ra->prev_pos;
+	loff_t last_pos = ra->prev_pos;                // 上次读取终点位置, 用于优化连续读取的预读策略
 
+	// 检查内容：
+	// 1. 文件位置 ≥ 0
 	if (unlikely(iocb->ki_pos < 0))
 		return -EINVAL;
+	// 2. 位置 ≤ 文件系统最大偏移
 	if (unlikely(iocb->ki_pos >= inode->i_sb->s_maxbytes))
 		return 0;
+	// 3. 用户缓冲区有效空间 > 0
 	if (unlikely(!iov_iter_count(iter)))
 		return 0;
 
+	// 优化处理：调整迭代器长度防止越界（避免读取超过最大文件偏移）
 	iov_iter_truncate(iter, inode->i_sb->s_maxbytes - iocb->ki_pos);
 	folio_batch_init(&fbatch);
 
 	do {
-		cond_resched();
+		// 调度点：避免长时间持有锁导致死锁
+		cond_resched();  // 主动让出CPU，避免长时占用
 
-		/*
-		 * If we've already successfully copied some data, then we
-		 * can no longer safely return -EIOCBQUEUED. Hence mark
-		 * an async read NOWAIT at that point.
-		 */
+		// 状态转换逻辑：已有数据复制到用户空间 → 无法返回 EIOCBQUEUED → 升级为 NOWAIT 模式
 		if ((iocb->ki_flags & IOCB_WAITQ) && already_read)
 			iocb->ki_flags |= IOCB_NOWAIT;
 
 		if (unlikely(iocb->ki_pos >= i_size_read(inode)))
-			break;
+			break;	  // 超过文件大小立即终止
 
+		// 核心：获取文件页
+		// 调用分析：内部处理页缓存/预读/同步I/O（详见前文解析）
 		error = filemap_get_pages(iocb, iter->count, &fbatch, false);
 		if (error < 0)
 			break;
 
-		/*
-		 * i_size must be checked after we know the pages are Uptodate.
-		 *
-		 * Checking i_size after the check allows us to calculate
-		 * the correct value for "nr", which means the zero-filled
-		 * part of the page is not copied back to userspace (unless
-		 * another truncate extends the file - this is desired though).
-		 */
+		// 关键设计：在获取页后再次检查文件大小（并发写可能改变大小）
 		isize = i_size_read(inode);
 		if (unlikely(iocb->ki_pos >= isize))
-			goto put_folios;
+			goto put_folios;  // 文件被截断时的安全处理
 		end_offset = min_t(loff_t, isize, iocb->ki_pos + iter->count);
 
-		/*
-		 * Once we start copying data, we don't want to be touching any
-		 * cachelines that might be contended:
-		 */
+		// 写映射处理
+		// 作用：检测文件是否有可写内存映射
+		// 影响：需处理CPU缓存一致性问题
 		writably_mapped = mapping_writably_mapped(mapping);
 
-		/*
-		 * When a read accesses the same folio several times, only
-		 * mark it as accessed the first time.
-		 */
+		// 页访问标记优化
+		// 优化点：仅在新页首次访问时标记，减少锁争用
 		if (!pos_same_folio(iocb->ki_pos, last_pos - 1,
 				    fbatch.folios[0]))
 			folio_mark_accessed(fbatch.folios[0]);
 
+		// 页数据复制循环
+		// 计算逻辑：bytes = min(剩余文件长度, 页剩余长度, 用户缓冲区剩余空间)
 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
 			struct folio *folio = fbatch.folios[i];
 			size_t fsize = folio_size(folio);
-			size_t offset = iocb->ki_pos & (fsize - 1);
+			size_t offset = iocb->ki_pos & (fsize - 1);  // 页内偏移
 			size_t bytes = min_t(loff_t, end_offset - iocb->ki_pos,
 					     fsize - offset);
 			size_t copied;
 
-			if (end_offset < folio_pos(folio))
+			if (end_offset < folio_pos(folio))  // 页超出读取范围
 				break;
-			if (i > 0)
-				folio_mark_accessed(folio);
-			/*
-			 * If users can be writing to this folio using arbitrary
-			 * virtual addresses, take care of potential aliasing
-			 * before reading the folio on the kernel side.
-			 */
-			if (writably_mapped)
-				flush_dcache_folio(folio);
 
+			// 缓存一致性处理
+			// 写映射场景：内存映射写可能修改缓存 → 需刷新数据缓存
+			if (i > 0)
+				folio_mark_accessed(folio);  // 批处理后续页标记访问
+			if (writably_mapped)
+				flush_dcache_folio(folio);   // 解决CPU缓存别名问题
+
+			// 核心复制操作
+			// 关键函数：copy_folio_to_iter()
+			// 将内核页安全复制到用户空间（处理地址空间转换）
 			copied = copy_folio_to_iter(folio, offset, bytes, iter);
 
 			already_read += copied;
@@ -2818,22 +2819,30 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
 			last_pos = iocb->ki_pos;
 
 			if (copied < bytes) {
-				error = -EFAULT;
+				error = -EFAULT;  // 典型原因：用户缓冲区无效
 				break;
 			}
 		}
-put_folios:
+put_folios: // 页释放处理（put_folios标签）
+		// 循环条件：
+		// 1. 用户缓冲区仍有空间
+		// 2. 未达文件末尾
+		// 3. 无致命错误
 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
 			struct folio *folio = fbatch.folios[i];
 
 			filemap_end_dropbehind_read(folio);
-			folio_put(folio);
+			folio_put(folio);  // 释放页引用
 		}
-		folio_batch_init(&fbatch);
+		folio_batch_init(&fbatch);  // 重置批处理结构
 	} while (iov_iter_count(iter) && iocb->ki_pos < isize && !error);
 
-	file_accessed(filp);
-	ra->prev_pos = last_pos;
+	// 收尾工作
+	file_accessed(filp);    // 更新文件访问时间
+	ra->prev_pos = last_pos; // 更新预读位置基准
+	// 返回策略：
+	// 1. 成功读取 >0 字节 → 返回读取总数
+	// 2. 完全失败 → 返回错误码
 	return already_read ? already_read : error;
 }
 EXPORT_SYMBOL_GPL(filemap_read);
