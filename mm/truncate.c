@@ -506,55 +506,65 @@ EXPORT_SYMBOL(truncate_inode_pages_final);
  * This function is similar to invalidate_mapping_pages(), except that it
  * returns the number of folios which could not be evicted in @nr_failed.
  */
+// 尝试无效化地址空间中的页范围
+// 成功无效化的页数
 unsigned long mapping_try_invalidate(struct address_space *mapping,
 		pgoff_t start, pgoff_t end, unsigned long *nr_failed)
 {
-	pgoff_t indices[PAGEVEC_SIZE];
-	struct folio_batch fbatch;
-	pgoff_t index = start;
+	// 设计要点：使用 PAGEVEC_SIZE (通常15) 批处理提高效率
+	pgoff_t indices[PAGEVEC_SIZE];      // 存储特殊条目的索引
+	struct folio_batch fbatch;           // 页批处理结构
+	pgoff_t index = start;               // 当前扫描位置
 	unsigned long ret;
-	unsigned long count = 0;
+	unsigned long count = 0;             // 成功计数
 	int i;
 
-	folio_batch_init(&fbatch);
+	folio_batch_init(&fbatch);           // 初始化批处理
+	// 主循环：查找并锁定条目
+	// 核心函数：find_lock_entries() 作用：查找并锁定 [index, end) 范围内的页
 	while (find_lock_entries(mapping, &index, end, &fbatch, indices)) {
-		bool xa_has_values = false;
-		int nr = folio_batch_count(&fbatch);
+		// 特殊值条目：XArray 中的非页数据（如 DAX 条目）
+		bool xa_has_values = false;      		// 标记是否存在特殊值条目
+		int nr = folio_batch_count(&fbatch);  	// 本批次条目数
 
+		// 遍历批处理中的每个条目  重要假设：页索引在操作期间不变
 		for (i = 0; i < nr; i++) {
 			struct folio *folio = fbatch.folios[i];
 
-			/* We rely upon deletion not changing folio->index */
-
+			// 处理特殊值条目
 			if (xa_is_value(folio)) {
-				xa_has_values = true;
-				count++;
-				continue;
+				xa_has_values = true;  // 标记存在特殊值, 检测非页条目（返回 true）
+				// 仅计数，不执行页操作
+				count++;               // 计为成功无效化
+				continue;              // 跳过页处理
 			}
 
+			// 尝试将页从地址空间移除
+			// 1. 成功：返回 失效页的数量
+			// 2. 失败：返回 0（页仍在映射中）
 			ret = mapping_evict_folio(mapping, folio);
-			folio_unlock(folio);
-			/*
-			 * Invalidation is a hint that the folio is no longer
-			 * of interest and try to speed up its reclaim.
-			 */
+			folio_unlock(folio);        // 无论成功与否都解锁
+
+			// 失败处理逻辑：处理无效化失败
+			// 设计意图：失败时加速页回收，避免重复失败
 			if (!ret) {
-				deactivate_file_folio(folio);
-				/* Likely in the lru cache of a remote CPU */
+				deactivate_file_folio(folio);  // 标记为非活动， 调用 deactivate_file_folio() → 提升回收优先级
 				if (nr_failed)
-					(*nr_failed)++;
+					(*nr_failed)++;    // 记录失败次数， 更新 nr_failed 计数（若调用者需要）
 			}
-			count += ret;
+			count += ret;              // 累计成功数
 		}
 
+		// 清理特殊值条目
 		if (xa_has_values)
+			// 删除 XArray 中的特殊值条目（如 DAX 条目）
 			clear_shadow_entries(mapping, indices[0], indices[nr-1]);
 
-		folio_batch_remove_exceptionals(&fbatch);
-		folio_batch_release(&fbatch);
-		cond_resched();
+		folio_batch_remove_exceptionals(&fbatch);  // 移除特殊条目
+		folio_batch_release(&fbatch);              // 释放页引用
+		cond_resched();                            // 主动让出CPU
 	}
-	return count;
+	return count;  // 返回成功无效化的总条目数， 非folio数量
 }
 
 /**

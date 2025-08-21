@@ -8852,31 +8852,46 @@ preempt:
 	resched_curr_lazy(rq);
 }
 
+// 从CFS运行队列中选择下一个要执行的任务
+// 参数：rq - CPU的运行队列结构
+// 返回：被选中的任务指针（task_struct*）
 static struct task_struct *pick_task_fair(struct rq *rq)
 {
-	struct sched_entity *se;
-	struct cfs_rq *cfs_rq;
+	struct sched_entity *se;	// 调度实体（任务或任务组）
+	struct cfs_rq *cfs_rq;		// CFS运行队列
 
 again:
-	cfs_rq = &rq->cfs;
+	cfs_rq = &rq->cfs;  // 从CPU的根CFS队列开始
+
+	// 检查条件：nr_queued为0表示队列空
+	// 处理：直接返回NULL（无任务可执行）
 	if (!cfs_rq->nr_queued)
-		return NULL;
+		return NULL;	// 队列无任务可调度
 
 	do {
-		/* Might not have done put_prev_entity() */
+		// 关键场景：当调度器未调用put_prev_entity()时
+		// 操作：更新当前运行实体的虚拟时间
+		// 重要性：保持公平性计算的准确性
 		if (cfs_rq->curr && cfs_rq->curr->on_rq)
-			update_curr(cfs_rq);
+			update_curr(cfs_rq);  // 更新当前实体统计
 
+		// 机制：check_cfs_rq_runtime() 检测任务组是否超出CPU带宽配额
+		// 处理：配额耗尽时跳回again重新尝试
 		if (unlikely(check_cfs_rq_runtime(cfs_rq)))
-			goto again;
+			goto again;  // 运行时耗尽需重试
 
-		se = pick_next_entity(rq, cfs_rq);
+		// 核心函数：pick_next_entity() 使用红黑树选择最左侧实体（最小虚拟时间）
+		se = pick_next_entity(rq, cfs_rq);  // 选择下一个实体
 		if (!se)
-			goto again;
-		cfs_rq = group_cfs_rq(se);
-	} while (cfs_rq);
+			goto again;  // 选择失败时重试
 
-	return task_of(se);
+		// 层次化调度关键：
+		//	若se是任务组 → 获取子队列继续选择
+		//	若se是具体任务 → group_cfs_rq()返回NULL终止循环
+		cfs_rq = group_cfs_rq(se);  // 获取调度实体对应的子队列
+	} while (cfs_rq);  // 循环直到选择具体任务
+
+	return task_of(se);  // 将调度实体转为任务结构
 }
 
 static void __set_next_task_fair(struct rq *rq, struct task_struct *p, bool first);
