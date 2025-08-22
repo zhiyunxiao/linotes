@@ -549,42 +549,47 @@ void folio_add_lru_vma(struct folio *folio, struct vm_area_struct *vma)
  * written out by flusher threads as this is much more efficient
  * than the single-page writeout from reclaim.
  */
+// 将文件页从活跃LRU链表移动到非活跃LRU链表，使其成为优先回收候选
 static void lru_deactivate_file(struct lruvec *lruvec, struct folio *folio)
 {
+	// 检查folio是否处于活跃状态，或新一代LRU算法是否启用
 	bool active = folio_test_active(folio) || lru_gen_enabled();
+	// 获取folio包含的页面数量（对透明大页或普通页）
 	long nr_pages = folio_nr_pages(folio);
 
+	// 如果folio标记为不可回收(unevictable)，直接退出函数
 	if (folio_test_unevictable(folio))
 		return;
 
-	/* Some processes are using the folio */
+	// 如果folio仍然被进程映射，说明正在使用，不进行失效操作
 	if (folio_mapped(folio))
 		return;
 
+	// 将folio从其当前LRU链表中移除
 	lruvec_del_folio(lruvec, folio);
+	// 清除活跃状态标志位
 	folio_clear_active(folio);
+	// 清除最近访问标志位
 	folio_clear_referenced(folio);
 
+	// 检查folio是否处于写回或脏状态
 	if (folio_test_writeback(folio) || folio_test_dirty(folio)) {
-		/*
-		 * Setting the reclaim flag could race with
-		 * folio_end_writeback() and confuse readahead.  But the
-		 * race window is _really_ small and  it's not a critical
-		 * problem.
-		 */
+		// 重新添加到LRU链表（但状态仍为非活跃）
 		lruvec_add_folio(lruvec, folio);
+		// 设置回收标志位，表示此页需要特殊处理
 		folio_set_reclaim(folio);
 	} else {
-		/*
-		 * The folio's writeback ended while it was in the batch.
-		 * We move that folio to the tail of the inactive list.
-		 */
+		// 添加到非活跃链表尾部（最优先回收位置）
 		lruvec_add_folio_tail(lruvec, folio);
+		// 统计页旋转事件（活跃→非活跃）
 		__count_vm_events(PGROTATED, nr_pages);
 	}
 
+	// 如果folio原本处于活跃状态
 	if (active) {
+		// 统计失效页数量
 		__count_vm_events(PGDEACTIVATE, nr_pages);
+		// 在相应memcg中更新统计
 		count_memcg_events(lruvec_memcg(lruvec), PGDEACTIVATE,
 				     nr_pages);
 	}

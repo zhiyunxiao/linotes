@@ -2390,39 +2390,76 @@ static void shrink_readahead_size_eio(struct file_ra_state *ra)
  * folio in the batch may have the readahead flag set or the uptodate flag
  * clear so that the caller can take the appropriate action.
  */
+// mapping：文件对应的地址空间
+// index：起始页面偏移（从该位置开始获取）
+// max：允许的最大页面偏移
+// fbatch：存储获取的folio的批量容器
 static void filemap_get_read_batch(struct address_space *mapping,
 		pgoff_t index, pgoff_t max, struct folio_batch *fbatch)
 {
+	/* 1. 初始化XArray迭代器 */
+	// 作用：
+	// 1. 创建XArray迭代器xas，指向文件页缓存的基数树  从给定的index开始遍历  mapping->i_pages：文件页缓存的基树结构
 	XA_STATE(xas, &mapping->i_pages, index);
 	struct folio *folio;
 
+	/* 2. 开启RCU保护模式 */
+	// 关键点：使用RCU（Read-Copy-Update）锁保护并发访问  确保遍历过程中不会被破坏
 	rcu_read_lock();
+
+	/* 3. 开始遍历页缓存 */
+	// xas_load：加载当前index处的folio
+	// xas_next：移动到下一个基数树条目
+	// 直到遇到NULL结束
 	for (folio = xas_load(&xas); folio; folio = xas_next(&xas)) {
+		/* 3.1 处理基数树异常项 */
+		// 检查是否遇到基数树重试标记（并发修改）  如果遇到，跳过当前项并继续下一次迭代
 		if (xas_retry(&xas, folio))
 			continue;
+		/* 3.2 边界检查和特殊项过滤 */
+		// 1. xas.xa_index > max	超出最大偏移范围
+		// 2. xa_is_value(folio)	遇到特殊值条目
+		// 3. xa_is_sibling(folio)	遇到内部节点
 		if (xas.xa_index > max || xa_is_value(folio))
 			break;
 		if (xa_is_sibling(folio))
 			break;
+		
+		/* 3.3 安全获取folio引用 */
+		// 尝试增加folio引用计数  如果失败（可能正在释放）跳转到retry  防止访问已被释放的folio
 		if (!folio_try_get(folio))
 			goto retry;
 
+		/* 3.4 并发修改验证 */
+		// 重新加载当前项（获取引用后） 检查是否已被修改/替换  如果变化则跳转到put_folio释放引用 
 		if (unlikely(folio != xas_reload(&xas)))
 			goto put_folio;
 
+		/* 3.5 添加到批处理容器 */
+		// 将folio添加到批量容器  folio_batch_add返回0表示容器已满  容器满时终止遍历
 		if (!folio_batch_add(fbatch, folio))
 			break;
+
+		/* 3.6 数据状态检查 */
+		// 1. !folio_test_uptodate	数据过期（需从磁盘加载）
+		// 2. folio_test_readahead	预读标记（存在异步I/O）
 		if (!folio_test_uptodate(folio))
 			break;
 		if (folio_test_readahead(folio))
 			break;
+
+		/* 3.7 跨大页优化 */
+		// 如果folio包含多页（order > 0）  直接跳转到大页的最后一页  避免逐页遍历提升性能
 		xas_advance(&xas, folio_next_index(folio) - 1);
-		continue;
+		continue;  // 继续下一次迭代
+/* 错误处理段 */
 put_folio:
-		folio_put(folio);
-retry:
-		xas_reset(&xas);
-	}
+		folio_put(folio);  // 释放folio引用
+retry: // 重置XArray迭代器到当前位置
+		xas_reset(&xas);   // 重置迭代器
+	} /* 结束循环 */
+
+	/* 4. 结束RCU保护 */
 	rcu_read_unlock();
 }
 
