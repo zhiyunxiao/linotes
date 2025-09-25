@@ -58,24 +58,84 @@ typedef void (bh_end_io_t)(struct buffer_head *bh, int uptodate);
  * for backward compatibility reasons (e.g. submit_bh).
  */
 struct buffer_head {
+	/*
+		含义：缓冲区的状态标志位图。这是最重要的字段之一，通过位操作来设置和检查各种状态。
+		常见状态标志：
+		BH_Dirty：缓冲区内容已被修改，与磁盘不一致，需要写回（同步）。
+		BH_Locked：缓冲区已被锁定，通常表示正在进行I/O操作（如读/写），其他操作需等待。
+		BH_Uptodate：缓冲区中的数据是有效的、最新的（读操作成功完成或数据已准备就绪）。
+		BH_Mapped：缓冲区已被映射到一个磁盘块（即b_blocknr是有效的）。
+		BH_Write_EIO：在写入该缓冲区时发生了I/O错误。
+	*/
 	unsigned long b_state;		/* buffer state bitmap (see above) */
+	/*
+		含义：指向同一个物理页（struct page）或新式的 folio（struct folio）中的下一个 buffer_head，形成一个循环链表。
+		目的：一个内存页（通常4KB）可以划分为多个更小的缓冲区（例如，1KB的块用于处理文件系统元数据）。这个链表将所有关联
+		到同一个页面的 buffer_head 连接起来，便于统一管理。
+	*/
 	struct buffer_head *b_this_page;/* circular list of page's buffers */
+	/*
+		含义：一个联合体（union），指向该缓冲区所在的内存页结构。b_page 是传统的页面指针，b_folio 是更新、更高效的大页内存管理结构（folio）。
+		目的：明确该缓冲区数据存储在物理内存中的哪个具体页面里。b_data 指针通常指向这个页面内部的某个偏移位置。
+	*/
 	union {
 		struct page *b_page;	/* the page this bh is mapped to */
 		struct folio *b_folio;	/* the folio this bh is mapped to */
 	};
 
+	/*
+		含义：该缓冲区所对应的磁盘上的逻辑块号（sector number）。这是 buffer_head 最核心的映射信息之一。
+		目的：精确指定了“内存中的这块数据是磁盘上哪个块的镜像”。
+	*/
 	sector_t b_blocknr;		/* start block number */
+	/*
+		含义：该缓冲区映射的大小（以字节为单位）。
+		目的：并非所有缓冲区都正好是一个磁盘块的大小（如4KB）。这个字段指明了这个特定缓冲区实际管理了多少字节的数据。
+	*/
 	size_t b_size;			/* size of mapping */
+	/*
+		含义：指向该缓冲区数据在内存中的起始地址的指针。
+		目的：这是程序真正读写数据时访问的指针。它通常是 b_page 或 b_folio 所指向的内存页内部的某个位置。
+	*/
 	char *b_data;			/* pointer to data within the page */
 
+	/*
+		含义：指向块设备结构（如 /dev/sda1）的指针。
+		目的：指明这个缓冲区属于哪个块设备。因为 b_blocknr 只是一个编号，必须结合具体的设备才能定位到磁盘上的唯一位置。
+	*/
 	struct block_device *b_bdev;
+	/*
+		含义：一个函数指针，指向I/O操作完成后的回调函数。
+		目的：当底层块设备驱动完成对该缓冲区的读或写操作后，会调用这个函数来通知上层“操作已完成”，以便进行状态更新（如设置 BH_Uptodate）和后续处理。
+	*/
 	bh_end_io_t *b_end_io;		/* I/O completion */
+	/*
+		含义：预留的私有数据指针，供 b_end_io 回调函数使用。
+		目的：为I/O完成回调函数传递一些额外的上下文信息。
+	*/
  	void *b_private;		/* reserved for b_end_io */
+	/*
+		含义：一个链表头，用于将多个 buffer_head 链接到一个更大的关联映射上。
+		目的：常用于 address_space 结构，将属于同一个地址空间的所有脏缓冲区（BH_Dirty）收集到一个链表中，方便高效地批量写回（如 fsync 操作）。
+	*/
 	struct list_head b_assoc_buffers; /* associated with another mapping */
+	/*
+		含义：指向与该缓冲区关联的地址空间结构的指针。
+		目的：指明这个缓冲区属于哪个文件的哪一部分的缓存。address_space 是管理文件内容（数据页）缓存的核心数据结构。
+	*/
 	struct address_space *b_assoc_map;	/* mapping this buffer is
 						   associated with */
+	/*
+		含义：该缓冲区的引用计数，类型是原子变量。
+		目的：用于跟踪有多少个使用者正在使用这个 buffer_head 结构本身。通过 get_bh() 和 put_bh() 函数来增加和减少计数。
+		当计数减到零时，内核会释放这个 buffer_head 结构所占用的内存，防止“use-after-free”错误。
+	*/
 	atomic_t b_count;		/* users using this buffer_head */
+	/*
+		含义：一种自旋锁，用于同步对 b_state 中 BH_Uptodate 标志的访问。
+		目的：注意注释：这个锁通常只由同一个页面中的第一个 buffer_head 持有。它用于串行化（序列化）该页面内所有其他缓冲区的I/O完成操作，
+		确保状态更新的安全性，避免竞态条件。
+	*/
 	spinlock_t b_uptodate_lock;	/* Used by the first bh in a page, to
 					 * serialise IO completion of other
 					 * buffers in the page */

@@ -81,16 +81,21 @@ __load_new_mm_context(struct mm_struct *next_mm)
 	(((unsigned long *)regs)[(r) <= 8 ? (r) : (r) <= 15 ? (r)-17 :	\
 				 (r) <= 18 ? (r)+11 : (r)-10])
 
+// asmlinkage: 指示编译器从堆栈传递参数，用于处理内核/用户空间切换。
+// address: 触发缺页的虚拟地址。
+// mmcsr: Alpha架构的机器状态寄存器值。
+// cause: 缺页原因（0=读缺页, 1=写缺页, 负值=执行缺页）。
+// regs: 指向内核保存的寄存器状态的指针。
 asmlinkage void
 do_page_fault(unsigned long address, unsigned long mmcsr,
 	      long cause, struct pt_regs *regs)
 {
-	struct vm_area_struct * vma;
-	struct mm_struct *mm = current->mm;
-	const struct exception_table_entry *fixup;
-	int si_code = SEGV_MAPERR;
-	vm_fault_t fault;
-	unsigned int flags = FAULT_FLAG_DEFAULT;
+	struct vm_area_struct * vma;	// vma: 将保存地址对应的虚拟内存区域。
+	struct mm_struct *mm = current->mm;	// mm: 当前进程的内存描述符。
+	const struct exception_table_entry *fixup;	// fixup: 用于内核异常修复的指针。
+	int si_code = SEGV_MAPERR;  // si_code: 发送信号的错误代码。
+	vm_fault_t fault;	// fault: 处理缺页后的返回状态。
+	unsigned int flags = FAULT_FLAG_DEFAULT;  // flags: 控制缺页处理行为的标志。
 
 	/* As of EV6, a load into $31/$f31 is a prefetch, and never faults
 	   (or is suppressed by the PALcode).  Support that for older CPUs
@@ -106,8 +111,7 @@ do_page_fault(unsigned long address, unsigned long mmcsr,
 		}
 	}
 
-	/* If we're in an interrupt context, or have no user context,
-	   we must not take the fault.  */
+	// 如果当前是内核线程（mm = NULL）或处在中断上下文，跳转至 no_context（内核错误处理）。
 	if (!mm || faulthandler_disabled())
 		goto no_context;
 
@@ -116,8 +120,8 @@ do_page_fault(unsigned long address, unsigned long mmcsr,
 		goto vmalloc_fault;
 #endif
 	if (user_mode(regs))
-		flags |= FAULT_FLAG_USER;
-	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, address);
+		flags |= FAULT_FLAG_USER;  // 设置用户模式标志
+	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, address);  // 记录缺页事件
 retry:
 	vma = lock_mm_and_find_vma(mm, address, regs);
 	if (!vma)

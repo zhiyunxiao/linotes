@@ -1131,6 +1131,7 @@ static unsigned int shrink_folio_list(struct list_head *folio_list,
 	folio_batch_init(&free_folios);
 	// memset(stat, 0, sizeof(*stat))：清零回收统计。
 	memset(stat, 0, sizeof(*stat));
+	// 在不需要紧急处理时，主动检查并自愿让出 CPU，为其他任务提供运行机会，从而避免内核代码路径过长导致系统无响应。
 	cond_resched();
 	// do_demote_pass = can_demote(...)：检查是否允许降级迁移。
 	do_demote_pass = can_demote(pgdat->node_id, sc, memcg);
@@ -1154,8 +1155,11 @@ retry:
 		if (!folio_trylock(folio))
 			goto keep;     // 尝试加锁，失败则暂不处理
 
+		// “硬件中毒”是一个状态标志，由内核的内存错误检测机制（如通过 EDAC - Error Detection and Correction）设置。
+		// 当内存控制器或内核检测到无法纠正的物理内存错误（Uncorrectable Error）时，就会将对应的页面标记为 PG_hwpoison。
 		if (folio_contain_hwpoisoned_page(folio)) { // 跳过硬件损坏页
-			// 移除硬件损坏页：解映射、解锁并释放。
+			// 这个函数会遍历所有映射了此坏页的进程的页表（Page Tables），并解除（Unmap） 这些虚拟地址到损坏物理页的映射关系。
+			// 这是最关键的一步，它确保了未来任何进程都无法再访问到这块损坏的内存，从而阻止了错误的传播。访问已解除映射的地址会触发页错误（Page Fault）
 			unmap_poisoned_folio(folio, folio_pfn(folio), false);
 			folio_unlock(folio);
 			folio_put(folio);
@@ -1169,13 +1173,18 @@ retry:
 		/* Account the number of base pages */
 		sc->nr_scanned += nr_pages;
 
+		// evictable:可驱逐，如果页面不可回收（例如，被 mlock 锁定），则跳转到 activate_locked 标签处的代码
 		if (unlikely(!folio_evictable(folio)))
 			goto activate_locked;
 
+		// sc->may_unmap : 如果为 true，允许回收器解除页面的映射（这是正常回收的必要步骤）
+		// 检查该 folio 是否仍然被进程映射，即是否还有页表项（Page Table Entry, PTE）指向这个物理页面
+		// keep_locked 会做什么？ 它会保留页面的锁，并将其直接放回它原来所在的非活跃 LRU 链表的尾部。
+		// 这意味着回收器放弃了本次回收尝试，但页面依然在回收队列中，可能会在下次扫描时再次被尝试
 		if (!sc->may_unmap && folio_mapped(folio))
 			goto keep_locked;
 
-		// 脏页/回写状态处理
+		// 用于获取页面的两个关键状态：是否是脏页（Dirty）和是否正在回写（Under Writeback）
 		folio_check_dirty_writeback(folio, &dirty, &writeback); // 检查脏页/回写状态
 
 		// 统计脏页信息（nr_dirty, nr_unqueued_dirty, nr_congested）。
@@ -1185,36 +1194,52 @@ retry:
 		if (dirty && !writeback)
 			stat->nr_unqueued_dirty += nr_pages;
 
+		// 这行代码的目的不是改变程序行为，而是为了监控和诊断:当前这个页面是否既正在被回写到磁盘，又曾经被标记为回收候选者
+		// 如果这个页面同时满足上述两个条件，那么就将这个页面的大小（以页数为单位）加到‘拥堵页面’的总数上去。
 		if (writeback && folio_test_reclaim(folio))
-			stat->nr_congested += nr_pages; // 记录 因 I/O 阻塞而无法回收的页面数量
+			stat->nr_congested += nr_pages; // congested：拥挤，记录 因 I/O 阻塞而无法回收的页面数量
 
+		// 条件入口：检查当前folio是否正处于回写（Writeback） 状态。如果是，则进入这个复杂的处理分支。
 		if (folio_test_writeback(folio)) {
+			// 获取地址空间：获取该folio所属的地址空间（address_space），即它属于哪个文件。这对于后续判断是否需要防止死锁至关重要。
 			mapping = folio_mapping(folio);
 
-			// Case 1：kswapd 遇高回写压力，立即激活。
-			if (current_is_kswapd() &&
-			    folio_test_reclaim(folio) &&
-			    test_bit(PGDAT_WRITEBACK, &pgdat->flags)) { // 内核设置此标志 → 表示节点上的页面正在被回写。
-				stat->nr_immediate += nr_pages;
-				goto activate_locked;
+			/*
+				设计意图：这是一种乐观策略。kswapd 发现系统已经有很多回写I/O（节点标志 PGDAT_WRITEBACK），并且这个folio自己
+				也正在回写且之前就被标记过（说明可能等了很久了）。为了避免 kswapd 被阻塞并能够继续扫描其他folio，它选择立即
+				放弃这个folio，相信在未来的某个周期，回写会完成，届时再回收它。这保证了 kswapd 的流畅性。
+			*/
+			if (current_is_kswapd() &&						// 当前执行上下文是 kswapd 内核线程（后台回收）
+			    folio_test_reclaim(folio) &&				// 该folio已经被标记为 回收候选（PG_reclaim）
+			    test_bit(PGDAT_WRITEBACK, &pgdat->flags)) { // folio所在的NUMA节点已经被标记为有回写活动（PGDAT_WRITEBACK）
+				stat->nr_immediate += nr_pages;				// 将folio的页数计入“立即处理”的统计项
+				goto activate_locked;						// 跳转到 activate_locked 标签，将folio置为活跃并放回活跃LRU链表
 
-			// Case 2：全局回收需避免死锁，标记回收标志后激活。
-			} else if (writeback_throttling_sane(sc) ||
-			    !folio_test_reclaim(folio) ||
-			    !may_enter_fs(folio, sc->gfp_mask) ||
+			/*
+				设计意图：这是一个安全与效率兼顾的策略。当遇到可能死锁、不允许等待或首次冲突的情况时，回收器选择“撤退”。它标记该folio（PG_reclaim）
+				并激活它，目的是在下一个回收周期中，这个folio很可能已经完成了回写，可以安全回收。这避免了潜在的死锁和性能延迟。
+			*/
+			} else if (writeback_throttling_sane(sc) ||		// 回写节制机制是“正常”的。这通常指在cgroup v1环境下，其回写节制逻辑可能产生问题，所以需要特殊处理。
+			    !folio_test_reclaim(folio) ||				// 该folio尚未被标记为回收候选。这意味着它是第一次遇到回写冲突。
+			    !may_enter_fs(folio, sc->gfp_mask) ||		// 当前回收上下文不允许执行文件系统操作（例如，在原子上下文中）。等待回写可能需要进入FS层，这是被禁止的。
 			    (mapping &&
+				// 最关键的条件。内核判断，如果等待这个folio的回写完成，可能会导致死锁。这通常发生在需要为回写分配内存（如申请request结构），
+				// 而回收器又正在等待该回写完成才能释放内存的循环依赖场景。
 			     mapping_writeback_may_deadlock_on_reclaim(mapping))) {
-				folio_set_reclaim(folio);
-				stat->nr_writeback += nr_pages;
-				goto activate_locked;
+				folio_set_reclaim(folio);					// 确保设置 PG_reclaim 标志，标记该folio为回收候选
+				stat->nr_writeback += nr_pages;				// 将folio的页数计入“回写”统计项
+				goto activate_locked;						// 跳转到 activate_locked 标签，将folio置为活跃并放回活跃LRU链表。
 
-			// Case 3：传统 memcg 等待回写完成。
+			/*
+				设计意图：这是一种积极阻塞的策略。当回收器判断没有死锁风险（不满足分支二的条件）且自己不是kswapd（或节点压力不大，不满足分支一的条件）时，
+				它选择“坚持到底”。它愿意花费一点时间等待I/O完成，以便在当前回收周期内就完成对这个folio的回收，从而更高效地释放内存。
+			*/
 			} else {
-				folio_unlock(folio);
-				folio_wait_writeback(folio);
+				folio_unlock(folio);						// 解锁folio。这是关键一步，允许其他线程（比如处理回写完成的I/O中断）访问该folio
+				folio_wait_writeback(folio);				// 同步等待，直到该folio的回写操作完成
 				/* then go back and try same folio again */
-				list_add_tail(&folio->lru, folio_list);
-				continue;
+				list_add_tail(&folio->lru, folio_list);		// 等待完成后，将folio重新加回当前回收列表的末尾
+				continue;	// 跳过本轮循环后续代码，立即开始下一轮循环。这样，在下一轮循环中，这个刚刚完成回写的folio将被再次处理，此时它应该已经变成一个干净的folio，可以被顺利回收
 			}
 		}
 
@@ -1234,7 +1259,9 @@ retry:
 		}
 
 		// 将冷页迁移到低速内存层级（如 DRAM → CXL）。
-		if (do_demote_pass &&
+		if (do_demote_pass &&	// 系统是否支持降级功能
+			// thp_migration_supported(): 检查系统内核是否支持透明大页（Transparent Huge Page, THP）的迁移
+			// !folio_test_large(folio): 如果当前处理的 folio 不是一个大页（即它是一个标准的 4KB 或类似大小的基础页面），那么这个条件也为真。
 		    (thp_migration_supported() || !folio_test_large(folio))) {
 			list_add(&folio->lru, &demote_folios); // 加入降级链表
 			folio_unlock(folio);
@@ -1242,70 +1269,134 @@ retry:
 		}
 
 		// 匿名页交换空间分配：为匿名页分配 Swap 条目，处理大页分裂等特殊情况。
+		// 是匿名页
+		// 有交换支持
 		if (folio_test_anon(folio) && folio_test_swapbacked(folio)) {
 			if (!folio_test_swapcache(folio)) {
+				// __GFP_IO 标志表示允许进行I/O操作，如果不允许I/O（!(__GFP_IO)）意味着不能交换，则跳转到 keep_locked
 				if (!(sc->gfp_mask & __GFP_IO))
 					goto keep_locked;
+				// 检查这个folio是否可能被DMA操作固定在内存中。DMA操作是设备直接访问内存，如果页面被固定，则不能被移走（包括交换），
+				// 否则会导致DMA访问失败。如果可能被固定，则跳转到 keep_locked，保留页面
 				if (folio_maybe_dma_pinned(folio))
 					goto keep_locked;
+				// 如果folio是大页（例如2MB的透明大页THP），需要特殊处理，因为交换子系统通常只处理4KB大小的页面。
 				if (folio_test_large(folio)) {
-					/* cannot split folio, skip it */
+					// 检查这个大页是否可以被拆分。如果不能拆分（例如，有无法处理的映射），则跳转到 activate_locked，激活并保留它。
 					if (!can_split_folio(folio, 1, NULL))
 						goto activate_locked;
 
+					// 这是一个针对一种特殊竞争条件的检查。如果folio的延迟列表不为空且页面被部分映射，则尝试立即拆分它。如果拆分失败，也跳转到 activate_locked。
 					if (data_race(!list_empty(&folio->_deferred_list) &&
 					    folio_test_partially_mapped(folio)) &&
 					    split_folio_to_list(folio, folio_list))
 						goto activate_locked;
 				}
-				// 分配 Swap 空间
+				// 调用 folio_alloc_swap 为这个folio分配一个交换槽, 如果分配失败（返回值非零），则进入if语句块处理失败情况
 				if (folio_alloc_swap(folio, __GFP_HIGH | __GFP_NOWARN)) {
 					int __maybe_unused order = folio_order(folio);
 
+					// 处理普通页失败：如果不是大页，直接跳转到 activate_locked_split
 					if (!folio_test_large(folio))
 						goto activate_locked_split;
-					/* Fallback to swap normal pages */
+					// 大页的回退策略：分配大页的交换槽失败，尝试将大页拆分成普通的4KB小页。如果拆分失败，跳转到 activate_locked
 					if (split_folio_to_list(folio, folio_list))
 						goto activate_locked;
+					// 透明大页：它自动地将许多普通的小页（通常为 4KB）合并成一个巨大的页（通常为 2MB 甚至 1GB），从而提升系统性能，而无需应用程序做任何修改
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+					// folio的大小是PMD级别的（例如2MB），则记录统计事件 THP_SWPOUT_FALLBACK。这表明一次大页交换因为分配失败而回退到了拆分模式
 					if (nr_pages >= HPAGE_PMD_NR) {
 						count_memcg_folio_events(folio,
 							THP_SWPOUT_FALLBACK, 1);
 						count_vm_event(THP_SWPOUT_FALLBACK);
 					}
 #endif
+					// 记录更详细的大页统计信息
 					count_mthp_stat(order, MTHP_STAT_SWPOUT_FALLBACK);
+					// 再次尝试分配：在拆分成功后，再次尝试为拆分后的单个小页分配交换槽。如果这次还失败，跳转到 activate_locked_split。
 					if (folio_alloc_swap(folio, __GFP_HIGH | __GFP_NOWARN))
 						goto activate_locked_split;
 				}
-				
-				// 确保脏标记
+
+				/*
+					标记为脏：如果 folio_alloc_swap 成功（或者回退成功后），调用 folio_mark_dirty 将页面标记为脏。
+					为什么？ 虽然这是一个匿名页，内容来自内存而非文件，但一旦它被成功分配了交换槽，它就被视为“交换缓存”中的一员。将其标记为脏，
+					是为了确保后续的代码（如 shrink_folio_list 的后面部分）会将其加入到脏页回写队列，最终将其内容写入交换分区。
+				*/
 				folio_mark_dirty(folio);
 			}
 		}
 
+		// 如果当前处理的 folio 包含了多个基础页面，但它又不是一个大页（复合页）
+		// 对于复合页来说，回收器可以一次性处理多个基础页面，这样效率更高，但是在处理的过程中，仅统计了一次，因此在这里，需要补上缺失的部分
+		// 值为nr_pages - 1
 		if ((nr_pages > 1) && !folio_test_large(folio)) {
+			// 记录了本次回收操作已经扫描了多少个基础页面
 			sc->nr_scanned -= (nr_pages - 1);
 			nr_pages = 1;
 		}
 
+		/*
+			条件检查：首先检查该folio是否仍然被映射（folio_mapped(folio)）。这是通过检查folio的_mapcount或_entire_mapcount来实现的。
+			如果folio没有被任何进程的页表映射，则跳过整个解除映射块。只有当folio还被映射时，才需要执行后续复杂的解除操作。
+		*/
 		if (folio_mapped(folio)) {
+			/*
+				初始化参数：
+				flags: 声明并初始化一个名为 flags 的枚举变量，用于控制 try_to_unmap 函数的行为。初始设置为 TTU_BATCH_FLUSH。这个标志告诉 try_to_unmap
+				使用批处理模式（效率更高），并在处理完成后刷新TLB（Translation Lookaside Buffer，页表缓存）。
+				was_swapbacked: 保存当前folio的swapbacked状态。这个状态表示folio在分配时是否被标记为“将来可能需要交换”。这个值会在后面用于诊断。
+			*/
 			enum ttu_flags flags = TTU_BATCH_FLUSH;
 			bool was_swapbacked = folio_test_swapbacked(folio);
 
+			/*
+				大页处理准备 1：检查folio是否可以被PMD（Page Middle Directory，中间页目录）级别的大页映射（例如，2MB的透明大页THP）。如果是，
+				则在 flags 中增加 TTU_SPLIT_HUGE_PMD 标志。这个标志指示 try_to_unmap 在解除映射前，先尝试拆分这个大页映射。因为处理一个巨大的
+				PMD映射可能比处理多个PTE（Page Table Entry，页表项）映射更复杂，有时拆分后逐个处理更简单可靠。
+			*/
 			if (folio_test_pmd_mappable(folio))
 				flags |= TTU_SPLIT_HUGE_PMD;
 
+			/*
+				大页处理准备 2：检查folio是否是一个大页。如果是，则增加 TTU_SYNC 标志。这个标志要求 try_to_unmap 进行同步的（阻塞的）操作。
+				对于大页，同步操作可以避免复杂的竞态条件，确保操作的原子性和正确性。
+			*/
 			if (folio_test_large(folio))
 				flags |= TTU_SYNC;
 
-			// 解映射（Unmapping）：解除 PTE/PMD 映射，确保页可回收。
+			/*
+				核心调用：调用 try_to_unmap 函数，传入folio和前面设置好的标志位。这个函数是内存管理中最复杂的函数之一。它的作用是：
+				遍历所有映射了该folio的进程的页表。
+				根据标志位，可能先拆分大页映射。
+				将找到的每个页表项（PTE）都替换为一个特殊的迁移条目或交换条目，或者直接置为空。
+				在这个过程中，它会刷新TLB和CPU缓存以确保一致性。
+				简单来说，它让所有曾经能访问这块物理内存的进程，下次访问时都会触发一个页错误（Page Fault）。
+			*/
 			try_to_unmap(folio, flags); // 解除物理内存映射
+			/*
+				结果验证：再次检查folio是否还被映射。如果 try_to_unmap 函数成功解除了所有映射，那么 folio_mapped(folio) 应该返回false。
+				如果仍然为true，说明解除映射失败了。
+			*/
 			if (folio_mapped(folio)) {
+				// 统计失败：如果解除映射失败，将失败的页面数（nr_pages）加到 stat->nr_unmap_fail 计数器中。这个统计信息对于监控和调试内存回收问题非常重要。
 				stat->nr_unmap_fail += nr_pages;
+				/*
+					诊断特定失败：这是一个更细致的诊断。它检查folio的 swapbacked 状态是否在本次操作中发生了变化。具体来说，如果folio之前没有交换支持
+					（!was_swapbacked），但现在有了（folio_test_swapbacked(folio)），这通常意味着有一个叫做 lazyfree 的机制尝试在解除映射的过程中
+					“偷懒”地给folio添加交换支持，但这个操作最终也失败了。这种特殊的失败会被记录到 nr_lazyfree_fail 中。
+				*/
 				if (!was_swapbacked &&
 				    folio_test_swapbacked(folio))
 					stat->nr_lazyfree_fail += nr_pages;
+				/*
+					失败处理：如果解除映射失败，使用 goto 语句跳转到 activate_locked 标签。activate_locked 处的代码会：
+					将folio的 PG_active 标志置位。
+					将folio放回活跃LRU链表。
+					解锁folio。
+					这意味着回收器放弃了回收这个folio的尝试。 因为它仍然被映射，强行回收会导致使用它的进程发生错误。
+					将其激活可以防止回收器在短时间内再次尝试扫描它，从而避免无谓的消耗。
+				*/
 				goto activate_locked; // 失败则激活
 			}
 		}
@@ -1313,13 +1404,16 @@ retry:
 		if (folio_maybe_dma_pinned(folio))
 			goto activate_locked;
 
+		// 获取地址空间：获取该folio所属的address_space，即它属于哪个文件。这是后续执行回写操作所必需的
 		mapping = folio_mapping(folio);
-		//  脏页回写（Pageout）
-		if (folio_test_dirty(folio)) {
-			if (folio_is_file_lru(folio) &&
-			    (!current_is_kswapd() ||
-			     !folio_test_reclaim(folio) ||
-			     !test_bit(PGDAT_DIRTY, &pgdat->flags))) {
+		
+		if (folio_test_dirty(folio)) {					// 脏页检查：确认folio是脏的（内容已被修改，与磁盘不一致）
+			if (folio_is_file_lru(folio) &&				// 对于文件脏页
+			    (!current_is_kswapd() ||				// 当前执行者不是后台回收线程kswapd（即是在直接回收路径中）
+			     !folio_test_reclaim(folio) ||			// 该folio没有被标记为回收候选（PG_reclaim）
+			     !test_bit(PGDAT_DIRTY, &pgdat->flags))) {		// Folio所在的NUMA节点没有处于全局脏页压力状态（PGDAT_DIRTY）
+				// 如果满足，则记录统计信息NR_VMSCAN_IMMEDIATE，标记folio为PG_reclaim，然后跳转到activate_locked将其激活并放回活跃链表。
+				// 这意味着内核认为在当前上下文中回写这个页面的代价太高或是不必要的，不如直接放弃。
 				node_stat_mod_folio(folio, NR_VMSCAN_IMMEDIATE,
 						nr_pages);
 				folio_set_reclaim(folio);
@@ -1327,58 +1421,102 @@ retry:
 				goto activate_locked;
 			}
 
+			// 检查1 - 只回收干净页：如果之前的引用检查（folio_check_references）返回FOLIOREF_RECLAIM_CLEAN，这意味着只允许回收干净的页面。
+			// 对于脏页，只能选择保留。跳转到keep_locked。
 			if (references == FOLIOREF_RECLAIM_CLEAN)
 				goto keep_locked;
+			// 检查2 - 文件系统许可：may_enter_fs检查当前回收上下文（sc->gfp_mask）是否被允许进入文件系统层。回写操作必然需要调用文件系统代码，
+			// 如果不允许（例如在原子上下文中），则无法进行回写。跳转到keep_locked。
 			if (!may_enter_fs(folio, sc->gfp_mask))
 				goto keep_locked;
+			// 检查3 - 回写许可：检查扫描控制结构sc中的may_writepage标志。这是一个总开关，如果明确禁止回写，则跳转到keep_locked。
 			if (!sc->may_writepage)
 				goto keep_locked;
 
+			// 刷新TLB：这是一个重要的同步点。它在尝试回写之前，确保所有针对该folio的解除映射操作（unmap） 已经在所有CPU上完成并被看到。这保证了数据的正确性。
 			try_to_unmap_flush_dirty();
-			// pageout() 负责将脏页写入磁盘或 Swap。
+			// 核心回写函数：调用pageout函数，尝试将folio的内容写回其对应的后端存储（文件或交换区）。这个函数是实际发起I/O操作的地方。它的返回值决定了后续的处理路径。
 			switch (pageout(folio, mapping, &plug, folio_list)) {
-			case PAGE_KEEP:    // 保留
+			case PAGE_KEEP:    		// 回写层（如文件系统）认为这个页面应该被保留（例如，它可能已经被其他方式处理了）。跳转到keep_locked。
 				goto keep_locked;
-			case PAGE_ACTIVATE:// 激活
+			case PAGE_ACTIVATE:		// 激活：回写失败或发生其他错误（例如，I/O错误）。内核决定不回收这个页面，而是将其激活。
+									// 注意这里也有之前提到的公平性修正代码，在激活前修正扫描计数。
 				if (nr_pages > 1 && !folio_test_large(folio)) {
 					sc->nr_scanned -= (nr_pages - 1);
 					nr_pages = 1;
 				}
 				goto activate_locked;
-			case PAGE_SUCCESS: // 回写成功
+			case PAGE_SUCCESS: 		// 成功：回写I/O被成功发起。但这并不代表回写已经完成！代码会进行一系列非常严谨的检查，以确保页面状态稳定：
 				if (nr_pages > 1 && !folio_test_large(folio)) {
 					sc->nr_scanned -= (nr_pages - 1);
 					nr_pages = 1;
 				}
 				stat->nr_pageout += nr_pages;
 
-				if (folio_test_writeback(folio))
-					goto keep;
-				if (folio_test_dirty(folio))
-					goto keep;
+				// 只有所有这些检查都通过，页面才是真正干净且稳定的，可以继续向下执行到PAGE_CLEAN case尝试回收。否则，会通过各种goto保持页面状态。
+				if (folio_test_writeback(folio)) // 检查是否还在回写中
+					goto keep;                   // 是，则保持原状，等待I/O完成
+				if (folio_test_dirty(folio))     // 检查是否又变脏了
+					goto keep;                   // 是，需要再次回写，保持原状
 
-				if (!folio_trylock(folio))
-					goto keep;
-				if (folio_test_dirty(folio) ||
+				if (!folio_trylock(folio))       // 尝试重新获取锁（因为I/O完成会解锁？）
+					goto keep;                   // 获取失败，保持原状
+				if (folio_test_dirty(folio) ||   // 再次检查脏和回写状态（状态可能又变了）
 				    folio_test_writeback(folio))
-					goto keep_locked;
+					goto keep_locked;            // 状态有变，保持并锁定
 				mapping = folio_mapping(folio);
 				fallthrough;
-			case PAGE_CLEAN:
+			case PAGE_CLEAN:					 // 干净：页面已经是干净的（可能pageout发现它不需要回写就变干净了）。程序会继续向下执行，
+												 // 后续代码会尝试回收这个干净的页面。
 				; /* try to free the folio below */
 			}
 		}
 
-		// 文件缓存释放
-		// 尝试释放文件关联的缓存（如 ext4 的 buffer_head）。
-		if (folio_needs_release(folio)) {
-			// 释放 Buffer 缓存
+		/**这里要释放的元数据，指的是进程无关的文件系统元数据，因为脏数据会写，可能会导致磁盘的目录/结构发生变化，因此需要回写这部分数据
+		 * 需要注意的是，由于数据更为重要且更容易发生变化，因此需要先确保数据的回写完成，不然完成了元数据的会写，但是脏数据因为某些原因回写失败
+		 * 那么元数据又需要恢复，逻辑会更为混乱
+		 */
+
+		// 在回收一个页面之前，尝试释放其关联的底层缓冲区缓存，如果成功并且页面再无其他引用，则直接将其释放。
+		// 一个folio即将被回收，但它可能仍然与块设备上的缓冲区（buffer_head） 相关联。这些缓冲区是文件系统
+		// 用于缓存磁盘块元数据的结构。为了安全地回收folio，内核需要先尝试解除这种关联。
+		if (folio_needs_release(folio)) {						// 检查这个folio是否需要执行release操作。
+																// 这通常意味着folio包含缓冲区头（buffer heads），
+																// 即folio_test_private(folio)为真。缓冲区头是旧版
+																// 内核用于将页面缓存与磁盘块映射起来的数据结构，在现代
+																// 文件系统中仍然用于元数据（如inode、位图）的缓存。
+			/*
+				核心操作 - 释放缓冲区：调用filemap_release_folio函数。
+				参数：folio和分配掩码sc->gfp_mask。
+				作用：这个函数会调用folio所属地址空间（address_space）的release_folio方法（通常由具体的文件系统，如ext4, XFS实现）。
+				文件系统会尝试解除所有关联的缓冲区头（buffer_head）。这可能涉及等待正在进行的I/O完成或丢弃干净的缓冲区。
+				返回值：如果释放成功，返回true；如果由于某些原因无法释放（例如，有缓冲区正在被使用或被锁定），返回false。
+				失败处理：如果释放失败（!filemap_release_folio），则跳转到activate_locked。这意味着回收无法继续，folio将被重新激活并放回活跃LRU链表。
+			*/
 			if (!filemap_release_folio(folio, sc->gfp_mask))
 				goto activate_locked;
+			/*
+				黄金回收机会检查：这是一个优化路径。它检查两个条件同时满足：
+				!mapping：folio没有所属的地址空间（address_space）。这意味着它已经不再属于任何文件的页缓存。
+				folio_ref_count(folio) == 1：folio的引用计数为1。这个唯一的引用很可能就是当前回收线程所持有的。
+				这两个条件同时成立，意味着：这个folio曾经是页缓存的一部分，但现在已经被完全剥离（无mapping），并且
+				除了回收器之外，没有任何其他地方在使用它（引用为1）。这是一个绝佳的、可以立即释放的候选者。
+			*/
 			if (!mapping && folio_ref_count(folio) == 1) {
-				folio_unlock(folio);
+				folio_unlock(folio);				// 解锁：因为folio的引用计数是1，解锁是安全的。解锁后，其他线程就无法再获取到它了。
+				/*
+					尝试释放：folio_put_testzero(folio)做两件事：
+					将folio的引用计数减1。
+					检查减1后引用计数是否变为0。
+					由于我们检查了引用计数原来是1，所以减1后必定为0。因此，folio_put_testzero(folio)总是返回true。
+					操作：如果返回true（确实为0），则跳转到free_it标签。free_it处的代码会直接将folio的物理内存释放回伙伴分配器（Buddy Allocator）。
+				*/
 				if (folio_put_testzero(folio))
 					goto free_it;
+				/*
+					不可能的分支：这个else分支在逻辑上永远不会被执行。因为我们在前面已经确定了folio_ref_count(folio) == 1，所以folio_put_testzero(folio)必定返回true。
+					代码意义：这里可能是一种防御性编程，或者是为了代码的对称性和未来可能的扩展。理论上，如果引用减1后不为0，它会统计回收的页面数并继续循环处理下一个folio。
+				*/
 				else {
 					nr_reclaimed += nr_pages;
 					continue;
@@ -1386,85 +1524,171 @@ retry:
 			}
 		}
 
+		/*
+			条件判断：检查当前folio是否同时满足两个条件：
+			folio_test_anon(folio)：它是一个匿名页（如进程的堆、栈内存）。
+			!folio_test_swapbacked(folio)：它没有交换支持（swapbacked）。
+			这是什么页面？ 通常，一个匿名页在分配时就会被标记为 swapbacked，表明它将来需要被交换。如果一个匿名页没有这个标志，
+			它很可能是在启用 CONFIG_Lazyfree 机制下，通过 madvise(MADV_FREE) 等操作标记为“延迟释放（Lazyfree）”的页面。这种
+			页面的特点是：内核可以在内存压力下直接丢弃它们，而无需交换到磁盘。如果进程之后又访问它，内核会自动用零填充一个新的页面。
+		*/
 		if (folio_test_anon(folio) && !folio_test_swapbacked(folio)) {
-			/* follow __remove_mapping for reference */
+			/*
+				引用计数冻结（Refcount Freezing）：这是极其重要的一步，是一种并发安全技术。
+				folio_ref_freeze(folio, 1) 在一个原子操作中完成两件事：
+				检查：当前folio的引用计数（_refcount）是否正好等于1。
+				冻结：如果等于1，则将其“冻结”，防止后续的任何 get_page()/folio_get() 操作成功（它们会失败），同时保持引用计数为1。
+				为什么？ 回收器持有最后一个引用。这个操作确保了在当前瞬间，没有任何其他线程能够再获得对这个folio的引用。这就安全地
+				“锁定”了folio的状态，避免了在后续操作中发生竞态条件（例如，另一个线程突然又映射了这个folio）。
+				失败处理：如果冻结失败（引用计数不等于1），说明有另一个线程在我们不知情的情况下获取了该folio的引用。此时不能继续回收，必须跳转到 keep_locked 保留页面。
+			*/
 			if (!folio_ref_freeze(folio, 1))
 				goto keep_locked;
+			// 记录统计信息：如果冻结成功，记录 PGLAZYFREED 事件。这表明一个Lazyfree页面被成功释放。这个统计信息对于监控系统内存行为和调试非常有用。
 			count_vm_events(PGLAZYFREED, nr_pages);
 			count_memcg_folio_events(folio, PGLAZYFREED, nr_pages);
+		/*
+			条件判断与函数调用：
+				!mapping：首先检查folio是否没有地址空间（mapping）。这可能发生在一些特殊的folio上。
+				!__remove_mapping(...)：如果folio有地址空间，则调用 __remove_mapping 这个核心函数来尝试移除它。这个函数也内部实现了引用计数检查和冻结逻辑，
+				与上面的 folio_ref_freeze 类似，但更复杂，因为它需要处理页缓存中的folio。
+			__remove_mapping 的工作：
+				再次检查folio的引用计数是否为预期值（并冻结）。
+				将folio从它的页缓存（address_space）的基数树（radix tree）或XArray中移除。
+				如果folio是匿名页，还会将其从交换缓存（swap cache）中移除。
+			失败处理：如果 __remove_mapping 返回 false（失败），或者folio根本没有 mapping，则跳转到 keep_locked。失败的原因通常也是在最后时刻引用计数发生了变化。
+		*/
 		} else if (!mapping || !__remove_mapping(mapping, folio, true,
 							 sc->target_mem_cgroup))
 			goto keep_locked;
 
+		// 解锁：只有在前面的所有步骤都成功之后，才会执行到这行代码。
+		// 意义：此时，folio已经成功地从所有管理数据结构中移除（页缓存、交换缓存），并且其引用计数被“冻结”为1（且无人能再获取引用）。
+		// 解锁是这个folio生命周期的转折点。解锁之后，这个folio就不再被任何锁保护，但因为引用计数为1且被冻结，唯一的引用持有者就是
+		// 本回收线程，因此它现在是一个“僵尸”页面，等待最后的释放。
 		folio_unlock(folio);
+
+// 这段代码是 Linux 内核内存回收的最终步骤，也是整个漫长回收过程的收获时刻。
+// 它的核心功能是：将已经成功解除所有关联的folio，安全、高效地批量释放回系统的空闲内存池（伙伴系统）。
 free_it:
+		/*
+			这是回收器的“功劳簿”。它将本次成功释放的页面数（nr_pages，对于复合页可能大于1）累加到总回收计数（nr_reclaimed）中。
+			这个计数器至关重要，它决定了本次回收循环是否已经完成了目标（例如 sc->nr_to_reclaim），从而决定是否应该停止回收。
+		*/
 		nr_reclaimed += nr_pages;      // 更新回收计数
 
+		/*
+			移除延迟拆分队列：如果这个folio之前因为某些原因（例如，是透明大页THP）被放入了延迟拆分队列，那么现在既然它
+			马上就要被释放了，拆分自然就没有必要了。这个函数将其从该队列中移除，避免内核在未来执行不必要的拆分操作。
+		*/
 		folio_unqueue_deferred_split(folio);
-		// 加入释放批次
+		/*
+			批量添加：这是性能优化的关键。folio_batch_add 函数尝试将当前folio添加到一个名为 free_folios 的本地批次数组中
+			（这个数组通常在函数开头声明为 struct folio_batch free_folios）。
+			== 0 的条件：folio_batch_add 函数在批次已满时会返回 0。一个 folio_batch 通常可以容纳15或16个folio（例如 PAGE_FOLIO_BATCH）。
+			如果返回 0，表示批次已满，需要立即处理这个批次的释放。如果返回非零，则只是成功添加，循环继续，等待批次被填满。
+		*/
 		if (folio_batch_add(&free_folios, folio) == 0) {
+			/*
+				内存控制组卸载：在释放物理内存之前，必须先更新内存控制组（memcg） 的统计信息。这个函数遍历批次中的所有folio，
+				从它们所属的memcg中减去这些页面所占用的内存计数。这是内存资源隔离和计费的关键步骤。
+			*/
 			mem_cgroup_uncharge_folios(&free_folios);
+			/*
+				刷新TLB：这是一个非常重要的内存屏障操作。它确保在释放这些页面之前，所有CPU上可能残留的、与这些页面相关的旧页表项
+				（TLB条目） 都被彻底清空（flush）。这是因为：
+				之前的 try_to_unmap 是批量进行的，可能有些TLB刷新是延迟的。
+				确保在物理页面被重新分配给他用之前，绝不会有任何一个CPU因为旧的TLB缓存而访问到错误的数据。这是防止数据损坏和系统不稳定性的关键安全措施。
+			*/
 			try_to_unmap_flush();
-			// 最终通过 free_unref_folios() 批量释放物理页。
+			/*
+				核心释放函数：这是最终执行释放操作的函数。它接收整个要释放的folio批次。
+				unref 的含义：这里的“unref”指的是这些folio的引用计数都已经降为0（“unreferenced”）。该函数会：
+				遍历批次中的每个folio。
+				根据folio的顺序（order），调用伙伴系统的释放接口（如 __free_pages），将物理内存归还到对应的空闲链表中。
+				更新zone的统计信息。
+				至此，这些物理页面正式成为空闲内存，可以被分配给任何需要它的进程或内核组件。
+			*/
 			free_unref_folios(&free_folios);
 		}
 		continue;
 
 activate_locked_split:
+		/*
+			这个条件检查和处理逻辑与我们之前讨论的完全一样。它判断当前处理的folio是否是一个复合页（Compound Page），
+			但不是透明大页（THP）（即 !folio_test_large(folio) 为真）。
+		*/
 		if (nr_pages > 1) {
 			sc->nr_scanned -= (nr_pages - 1);
 			nr_pages = 1;
 		}
+/*
+	设计意图：既然决定不回收这个folio了（要激活它），而交换空间又很紧张（或者folio被锁定根本不能交换），
+	那么占着这个交换槽就是一种浪费。释放它可以让其他更需要交换的页面使用。这是一种资源的回收和再利用。
+*/
 activate_locked:
 		/* Not a candidate for swapping, so reclaim swap space. */
-		if (folio_test_swapcache(folio) &&
-		    (mem_cgroup_swap_full(folio) || folio_test_mlocked(folio)))
-			folio_free_swap(folio);
+		if (folio_test_swapcache(folio) &&			// folio_test_swapcache(folio)：该folio在交换缓存（swap cache） 中。
+													// 这意味着它是一个匿名页，并且已经被分配了交换空间（一个swap entry）。
+		    (mem_cgroup_swap_full(folio) || folio_test_mlocked(folio)))		// 其所属的内存控制组（memcg）的交换空间已满，或者该folio被 mlock() 锁定了。
+			folio_free_swap(folio);					// 如果上述条件满足，则调用此函数释放为该folio分配的交换槽（swap slot）
 		VM_BUG_ON_FOLIO(folio_test_active(folio), folio);
-		if (!folio_test_mlocked(folio)) {
-			int type = folio_is_file_lru(folio);
-			folio_set_active(folio);
-			stat->nr_activate[type] += nr_pages;
-			count_memcg_folio_events(folio, PGACTIVATE, nr_pages);
+		if (!folio_test_mlocked(folio)) {			// 检查folio没有被 mlock() 系统调用锁定。被锁定的页面不能换出，也不需要改变其活跃状态。
+			int type = folio_is_file_lru(folio);	// 判断folio类型（0代表匿名页，1代表文件页）
+			folio_set_active(folio);				// 设置folio的 PG_active 标志。这是最关键的一步，标志着folio状态的改变
+			stat->nr_activate[type] += nr_pages;	// 更新统计信息，记录本次激活了多少页（区分类型）
+			count_memcg_folio_events(folio, PGACTIVATE, nr_pages);	// 记录内存控制组级别的事件计数。
 		}
 keep_locked:
 		folio_unlock(folio);
 keep:
-		list_add(&folio->lru, &ret_folios);
+		list_add(&folio->lru, &ret_folios);				// 将folio添加到 ret_folios 链表中。这个链表专门用于收集所有在本轮回收中未被成功回收或释放的folio。
 		VM_BUG_ON_FOLIO(folio_test_lru(folio) ||
 				folio_test_unevictable(folio), folio);
 	}
 	/* 'folio_list' is always empty here */
 
 	/* Migrate folios selected for demotion */
-	nr_demoted = demote_folio_list(&demote_folios, pgdat); // 执行降级
-	nr_reclaimed += nr_demoted;
-	stat->nr_demoted += nr_demoted;
+	nr_demoted = demote_folio_list(&demote_folios, pgdat); // 这是执行内存降级（Demotion） 的核心函数。它接收之前收集的、准备迁移到慢速内存的folio列表
+															// （demote_folios），并尝试实际迁移它们
+	// 将成功降级的页面数也算作本次回收的成功成果。因为虽然物理内存没有被释放，但宝贵的高速内存空间已经被腾出来了
+	nr_reclaimed += nr_demoted;								// 返回成功降级的folio数量
+	stat->nr_demoted += nr_demoted;							// 更新统计信息，记录降级的页面数。
 	// 降级失败且非主动回收时，重试回收而非降级。
-	if (!list_empty(&demote_folios)) {
-		list_splice_init(&demote_folios, folio_list);
+	if (!list_empty(&demote_folios)) {						// 如果降级操作完成后，demote_folios 列表不为空，说明有些folio降级失败了
+		list_splice_init(&demote_folios, folio_list);		// 将这些降级失败的folio重新移回最初的回收列表（folio_list）中
 
-		if (!sc->proactive) {
-			do_demote_pass = false;
-			goto retry;            // 未成功则重试
+		if (!sc->proactive) {								// 如果当前回收是直接回收（!sc->proactive），则采取更激进的策略
+			do_demote_pass = false;							// 禁用降级功能。既然降级失败了，就不再尝试。
+			goto retry;            							// 跳转回函数开头的 retry: 标签。这意味着这些降级失败的folio将在禁用降级的情况下，
+															// 重新经历一遍回收流程，这次内核会尝试用传统的回收方法（如交换或丢弃）来处理它们。
 		}
 	}
 
-	// stat->nr_activate：激活的页数
+	// 计算总激活数：将匿名页（index 0）和文件页（index 1）的激活数量相加，得到总共激活的页面数（pgactivate），用于后续的事件计数
 	pgactivate = stat->nr_activate[0] + stat->nr_activate[1];
 
-	// 资源释放与统计
-	mem_cgroup_uncharge_folios(&free_folios); // 解除 memcg 计数
-	try_to_unmap_flush();
-	free_unref_folios(&free_folios);          // 释放物理页
+	// 释放批处理：这是回收的最终步骤，处理的是那些已经成功解除所有关联、可以释放的folio（free_folios 列表）。
+	mem_cgroup_uncharge_folios(&free_folios); // 从内存控制组（memcg）中解除这些页面的计数（“充能”的逆操作）。
+	try_to_unmap_flush();					  // 执行最后的TLB刷新，确保所有CPU都不会再访问这些即将被释放的页面。
+	free_unref_folios(&free_folios);          // 最终调用伙伴系统（Buddy System），将这些folio的物理内存释放回空闲页列表。这是真正释放内存的地方。
 
+	// 处理保留页：将之前收集的、所有未成功回收的folio（ret_folios）重新拼接回原始的回收列表（folio_list）中。调用这个函数的上级逻辑会
+	// 负责将这些folio重新放回它们合适的LRU链表。
 	list_splice(&ret_folios, folio_list);     // 剩余页放回 LRU
-	// PGACTIVATE 事件计数
+	// 记录激活事件：向全局虚拟机统计中记录 PGACTIVATE 事件，表示本次回收过程中激活了多少页面
 	count_vm_events(PGACTIVATE, pgactivate);
 
+	// 清理交换插件：如果在回收过程中使用了交换写的聚合插件（plugging）来优化I/O，这里要卸载（unplug）它，以确保所有缓存的写操作都被刷新到磁盘。
 	if (plug)
 		swap_write_unplug(plug);
-	// nr_reclaimed：实际回收的页数
+	/*
+		返回结果：函数最终返回 nr_reclaimed。这个数值包含了：
+		成功释放的页数（free_folios）。
+		成功降级的页数（nr_demoted）。
+		（可能还有其他的，如惰性释放等）。
+		这个返回值告诉调用者：“我这次一共帮你腾出了这么多页的内存”。
+	*/
 	return nr_reclaimed;                      // 返回回收页数
 }
 
@@ -4039,35 +4263,59 @@ static unsigned long lru_gen_min_ttl __read_mostly;
 static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
 {
 	struct mem_cgroup *memcg;
+	// 从全局变量lru_gen_min_ttl读取最小TTL(Time-To-Live)值
 	unsigned long min_ttl = READ_ONCE(lru_gen_min_ttl);
+	// 如果min_ttl为0，则reclaimable初始化为true，否则为false
 	bool reclaimable = !min_ttl;
 
+	// 内核警告：确保当前进程是kswapd(内核交换守护进程)
 	VM_WARN_ON_ONCE(!current_is_kswapd());
 
+	// 设置初始扫描优先级，基于内存压力和其他因素
 	set_initial_priority(pgdat, sc);
 
+	// 开始迭代所有内存控制组(memcg)，从根开始
 	memcg = mem_cgroup_iter(NULL, NULL, NULL);
 	do {
+		// 获取当前memcg在指定内存节点上的lruvec(LRU向量)
 		struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
 
+		// 计算当前memcg的内存保护值
 		mem_cgroup_calculate_protection(NULL, memcg);
 
+		// 如果之前认为不可回收，检查当前memcg是否有可回收页面
 		if (!reclaimable)
 			reclaimable = lruvec_is_reclaimable(lruvec, sc, min_ttl);
-	} while ((memcg = mem_cgroup_iter(NULL, memcg, NULL)));
+			/*
+				它获取传入的 min_ttl（最小存活时间，单位是秒）。
+				它检查指定的 lruvec（一个内存控制组在一个内存节点上的所有LRU列表）中，是否存在任何一个世代，其年龄（创建时间到现在的时间差）大于 min_ttl。
+				如果存在这样的世代，说明这个 lruvec 里肯定有“足够老”的、可以安全回收的页面。函数返回 true。
+				如果不存在，说明这个 lruvec 里所有页面都“太年轻”了，最近都被访问过。函数返回 false。
+				所以，lru_gen_age_node 通过遍历所有 memcg，并调用 lruvec_is_reclaimable 来询问每个 memcg：”你手下有没有老了可以回收的页面？
+				“ 只要有一个 memcg 回答“有”，reclaimable 就会变为 true
+			*/
+	} while ((memcg = mem_cgroup_iter(NULL, memcg, NULL))); // 继续迭代下一个memcg
 
 	/*
-	 * The main goal is to OOM kill if every generation from all memcgs is
-	 * younger than min_ttl. However, another possibility is all memcgs are
-	 * either too small or below min.
-	 */
+     * 主要目标：如果所有memcg的所有代都比min_ttl年轻，则触发OOM kill
+     * 但另一种可能是所有memcg都太小或低于最小值
+     */
+    // 如果未找到可回收页面且成功获取OOM锁(避免并发OOM)
+	/*
+		它是一个安全阀或最终检查。它在 shrink_node 等函数尝试回收之后被调用。它的逻辑是：
+		“我已经让 shrink_node 尽力去回收了。现在让我检查一下，是不是因为所有页面都太年轻（!reclaimable）导致它什么都没回收到？
+		如果是这样，并且内存压力依然巨大，那说明我们遇到了极端情况，只能启动终极手段——OOM Killer来杀死进程释放内存了。”
+	*/
 	if (!reclaimable && mutex_trylock(&oom_lock)) {
+		// 准备OOM控制结构
 		struct oom_control oc = {
-			.gfp_mask = sc->gfp_mask,
+			.gfp_mask = sc->gfp_mask,  // 传递分配掩码
 		};
 
+		// 触发Out-of-Memory killer选择进程终止
 		out_of_memory(&oc);
 
+		// 释放OOM锁
 		mutex_unlock(&oom_lock);
 	}
 }
@@ -4185,11 +4433,11 @@ bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
 
 /* see the comment on MEMCG_NR_GENS */
 enum {
-	MEMCG_LRU_NOP,
-	MEMCG_LRU_HEAD,
-	MEMCG_LRU_TAIL,
-	MEMCG_LRU_OLD,
-	MEMCG_LRU_YOUNG,
+	MEMCG_LRU_NOP,		// 回收操作无实质结果
+	MEMCG_LRU_HEAD,		// 回收困难，需持续关注
+	MEMCG_LRU_TAIL,		// 回收成功，让其“休息”
+	MEMCG_LRU_OLD,		// 内存访问频率低
+	MEMCG_LRU_YOUNG,	// 内存访问频率高
 };
 
 static void lru_gen_rotate_memcg(struct lruvec *lruvec, int op)
@@ -4575,75 +4823,136 @@ static int isolate_folios(struct lruvec *lruvec, struct scan_control *sc, int sw
 	return 0;
 }
 
+/*
+	作用：从给定的 LRU 向量 (lruvec) 中隔离出一批页面，并尝试实际回收（evict）它们。它管理了从 LRU 列表隔离到最终释放的整个生命周期。
+	参数：
+		lruvec: 要执行回收的目标 LRU 向量。
+		sc: 扫描控制结构，包含回收上下文。
+		swappiness: 控制匿名页与文件页回收权重的值。
+	返回值：返回成功扫描的页面数量（注意：不一定是回收的数量）。
+*/
 static int evict_folios(struct lruvec *lruvec, struct scan_control *sc, int swappiness)
 {
-	int type;
+	int type;							// 将记录本次回收的主要类型（匿名页或文件页）
 	int scanned;
-	int reclaimed;
-	LIST_HEAD(list);
-	LIST_HEAD(clean);
+	int reclaimed;						// 用于记录扫描和回收的页面数
+	LIST_HEAD(list);					// 两个链表头，用于临时存放从 LRU 列表隔离（isolate） 出来的页面。
+	LIST_HEAD(clean);					// list 是主要的工作链表，clean 用于存放需要重试的页面
 	struct folio *folio;
-	struct folio *next;
+	struct folio *next;					// 用于遍历链表的指针
 	enum vm_event_item item;
-	struct reclaim_stat stat;
-	struct lru_gen_mm_walk *walk;
-	bool skip_retry = false;
+	struct reclaim_stat stat;			// 用于记录回收过程的详细统计信息
+	struct lru_gen_mm_walk *walk;		// 指向 MM walker 结构，用于处理页表遍历
+	bool skip_retry = false;			//  一个标志，控制是否跳过重试逻辑
 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
-	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec);	// 获取相关联的 LRUGen 结构、内存控制组和 NUMA 节点信息
 
+	// 获取锁：获取保护 lruvec 链表的自旋锁，并禁用本地中断。这是必需的，因为接下来要修改链表结构
 	spin_lock_irq(&lruvec->lru_lock);
 
+	/*
+		核心操作1 - 隔离：调用 isolate_folios。这是最关键的函数之一。它根据 LRUGen 的代际信息、swappiness 设置和扫描优先级，
+		从“最老”的代中精心挑选出一批候选页面，将它们从 LRU 链表中移除，并加入到临时链表 list 中。scanned 记录了这次隔离了多少页面
+	*/
 	scanned = isolate_folios(lruvec, sc, swappiness, &type, &list);
 
+	/*
+		核心操作2 - 推进代序：调用 try_to_inc_min_seq。如果可能，它尝试增加 lrugen->min_seq（最小代序）。这意味着所有比这个
+		新代序更老的页面都已经被回收或没有效用了。这是 LRUGen 算法管理代际的核心。
+	*/
 	scanned += try_to_inc_min_seq(lruvec, swappiness);
 
+	/*
+		有效性检查：检查可回收的最老代序是否与当前最大代序过于接近。如果是，说明代际轮转太快，可能没有足够的页面可供回收，
+		此时将 scanned 重置为 0，暗示本次回收无效。
+	*/
 	if (evictable_min_seq(lrugen->min_seq, swappiness) + MIN_NR_GENS > lrugen->max_seq)
 		scanned = 0;
 
+	// 释放锁：释放 LRU 锁。这是一个重要的优化：实际耗时的页面回收操作（如I/O）将在无锁的情况下进行，避免长时间阻塞其他操作。
 	spin_unlock_irq(&lruvec->lru_lock);
 
+	// 空检查：如果隔离出来的链表是空的（没有找到可回收的页面），则直接返回扫描的页面数。
 	if (list_empty(&list))
 		return scanned;
 retry:
+	/*
+		核心操作3 - 回收：调用 shrink_folio_list。这是另一个最关键的函数，它负责实际处理 list 中的每一个页面：
+		匿名页：写入交换分区（swap out）。
+		干净的文件页：直接丢弃。
+		脏的文件页：安排回写（writeback）到磁盘。
+		最终，将成功处理的页面从其映射中解除，并释放其内存。
+		reclaimed 记录了成功回收的页面数。
+	*/
 	reclaimed = shrink_folio_list(&list, pgdat, sc, &stat, false, memcg);
+
+	// 统计脏页：将本次回收中遇到的、无法立即加入回写队列的脏页数量累加到全局计数器。这是之前提到的触发 wakeup_flusher_threads 的关键数据。
 	sc->nr.unqueued_dirty += stat.nr_unqueued_dirty;
+
+	// 累计回收数：将本次回收的页面数累加到全局回收计数中。
 	sc->nr_reclaimed += reclaimed;
+	// 跟踪点：发出一个内核跟踪事件，用于调试和性能分析。工具如 perf 或 trace-cmd 可以捕获此事件。
 	trace_mm_vmscan_lru_shrink_inactive(pgdat->node_id,
 			scanned, reclaimed, &stat, sc->priority,
 			type ? LRU_INACTIVE_FILE : LRU_INACTIVE_ANON);
 
+	// 遍历剩余链表：反向遍历 list 链表。此时链表中包含的是未能被 shrink_folio_list 成功回收的页面。
 	list_for_each_entry_safe_reverse(folio, next, &list, lru) {
 		DEFINE_MIN_SEQ(lruvec);
 
+		// 不可回收页处理：如果页面变得不可回收（例如，被 mlock 锁定），则将其从临时链表中删除，并放回其对应的 LRU 链表。
 		if (!folio_evictable(folio)) {
 			list_del(&folio->lru);
 			folio_putback_lru(folio);
 			continue;
 		}
 
-		/* retry folios that may have missed folio_rotate_reclaimable() */
+		// 重试候选页：如果页面非活跃、无映射、干净、不在回写中，说明它可能是一个很好的候选者，只是上次回收时可能错过了
+		// 某些状态更新。将其移动到 clean 链表，准备进行重试。
 		if (!skip_retry && !folio_test_active(folio) && !folio_mapped(folio) &&
 		    !folio_test_dirty(folio) && !folio_test_writeback(folio)) {
 			list_move(&folio->lru, &clean);
 			continue;
 		}
 
-		/* don't add rejected folios to the oldest generation */
+		// 拒绝页处理：对于那些属于最老代序 (min_seq) 却又回收失败的页面，通过强制设置 PG_active 标志
+		// 来将其暂时排除在下一轮的回收范围之外，防止无限循环地尝试回收它们。
 		if (lru_gen_folio_seq(lruvec, folio, false) == min_seq[type])
 			set_mask_bits(&folio->flags, LRU_REFS_FLAGS, BIT(PG_active));
 	}
 
+	// 加锁并放回：重新获取 LRU 锁，将处理完的剩余页面（不包括已移到 clean 的）重新移回适当的 LRU 链表。
 	spin_lock_irq(&lruvec->lru_lock);
-
 	move_folios_to_lru(lruvec, &list);
 
-	walk = current->reclaim_state->mm_walk;
+	// 处理 MM Walker：如果当前回收上下文中存在批处理的页表遍历状态，则重置其批处理大小，可能与后续的页表访问位更新有关。
+	// current->reclaim_state：当内存回收在执行直接回收（在进程上下文中）时，它会在进程的 task_struct 中存储一个
+	// reclaim_state 结构，用于记录与本次回收相关的状态信息。
+	walk = current->reclaim_state->mm_walk;	// 这行代码获取了与当前正在执行回收的进程相关联的页表遍历器
+	// walk->batched 为 true：这是一个标志，表示这个遍历器正处于批处理模式
+	// 批处理模式：为了提升效率，LRUGen 不会每处理一个页面就遍历一次页表，而是会“攒”一批页面，然后一次性遍历页表来收集
+	// 所有这些页面的访问信息。walk->batched 为 true 就意味着这个遍历器正在执行这种批量操作。
 	if (walk && walk->batched) {
+		/*
+			重置目标 LRU 向量：将页表遍历器的 lruvec 字段指向刚刚完成回收操作的 LRU 向量（即当前函数的参数 lruvec）。
+			为什么需要这个？ 因为页表遍历器 (walk) 可能被多个 LRU 向量共享或重用。在完成对一个 lruvec 的操作后，需要
+			更新遍历器的上下文，以确保后续的页表遍历（如果发生）收集到的信息会关联到正确的 LRU 向量上。
+		*/
 		walk->lruvec = lruvec;
+		/*
+			重置批处理大小：调用 reset_batch_size 函数。
+			这个函数做什么？ 它的内部逻辑通常是：walk->max_batch = MAX_BATCH_SIZE; 或类似的代码。它将遍历器内部用于跟踪
+			批处理进度的计数器重置为初始的最大值。
+			为什么需要这个？ 批处理机制通常有一个预算（例如，最多一次收集 64 个页面的信息）。当一次批处理操作完成后
+			（例如，为当前的 lruvec 完成了回收），需要“重置预算”，为下一次可能发生的批处理操作做好准备。这确保了每次批处理
+			都有一个公平的、全额的初始预算，避免上一次的消耗影响到下一次。
+		*/
 		reset_batch_size(walk);
 	}
 
+	// 更新统计信息：更新 LRU 向量、内存控制组和全局 VM 的多种统计事件计数器（如 PGSTEAL_KSWAPD, PGSTEAL_ANON），
+	// 这些信息可通过 /proc/vmstat 查看。
 	__mod_lruvec_state(lruvec, PGDEMOTE_KSWAPD + reclaimer_offset(sc),
 					stat.nr_demoted);
 
@@ -4653,15 +4962,18 @@ retry:
 	count_memcg_events(memcg, item, reclaimed);
 	__count_vm_events(PGSTEAL_ANON + type, reclaimed);
 
+	// 最终释放锁：释放 LRU 锁。
 	spin_unlock_irq(&lruvec->lru_lock);
 
+	// 重试：将之前分离到 clean 链表中的、被认为值得重试的页面，重新合并回主工作链表 list。如果这个链表不为空，
+	// 则设置 skip_retry 标志（防止无限重试），并跳转回 retry 标签处，再次调用 shrink_folio_list 尝试回收它们。
 	list_splice_init(&clean, &list);
-
 	if (!list_empty(&list)) {
 		skip_retry = true;
 		goto retry;
 	}
 
+	// 返回：返回最初成功扫描/隔离的页面数量。
 	return scanned;
 }
 
@@ -4754,56 +5066,130 @@ static bool should_abort_scan(struct lruvec *lruvec, struct scan_control *sc)
 	return true;
 }
 
+/*
+	作用：对一个给定的 LRU 向量 (lruvec) 进行内存页面回收的尝试。它会尝试回收该向量中一定数量的页面。
+	参数：
+		lruvec: 指向要回收的目标 LRU 向量的指针（代表一个 memcg 在某个 NUMA 节点上的内存）。
+		sc: 指向扫描控制结构的指针，包含了回收的上下文信息（如优先级、分配阶数等）。
+	返回值：返回一个布尔值，表示是否应该旋转（调整）该 LRU 向量在队列中的位置。true 表示应该调整，false 表示不需要。
+*/
 static bool try_to_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 {
-	long nr_to_scan;
-	unsigned long scanned = 0;
-	int swappiness = get_swappiness(lruvec, sc);
-
+	long nr_to_scan;								// 本次函数调用计划要扫描的页面总数。它是一个动态计算的值。
+	unsigned long scanned = 0;						// 用于记录在当前循环中已经成功扫描的页面数量。
+	int swappiness = get_swappiness(lruvec, sc);	// 通过 get_swappiness() 获取交换倾向性值。这个值决定了回收时在匿名页和文件页
+													// 之间的偏好程度（0-200）。0 表示尽量避免交换匿名页，200 表示积极交换。
 	while (true) {
-		int delta;
+		int delta;									// 用于记录单次 evict_folios 调用实际回收的页面数量。
 
+		// 关键函数。它根据当前内存压力 (sc->priority)、LRUGen 的代际信息、以及 swappiness 设置，计算出本次循环期望回收的页面数量。
+		// 这个值可能是正数，也可能是 0 或负数（后面会解释）。
 		nr_to_scan = get_nr_to_scan(lruvec, sc, swappiness);
+		/*
+			退出条件 1：如果 get_nr_to_scan 返回的值小于等于 0，说明：
+				要么没有更多页面需要扫描了（例如，该代的所有页面都已扫描过）。
+				要么系统压力不大，不需要继续扫描。
+				此时直接跳出循环。
+		*/
 		if (nr_to_scan <= 0)
 			break;
 
+		/*
+			核心回收函数：evict_folios 是真正执行页面回收工作的函数。它：
+			从 lruvec 的 LRU 列表中选出最合适的候选页面（通常是“最老”一代的页面）。
+			根据页面类型和 swappiness 设置，决定是回收文件页还是匿名页。
+			对于文件页：如果是脏页，会安排回写（writeback），然后将其从缓存中移除。
+			对于匿名页：将其内容换出（swap out）到交换空间。
+			最终解除页面与物理内存的映射，并将其释放回伙伴系统（Buddy System）。
+			返回值：delta 表示本次调用实际成功回收的页面数量。
+		*/
 		delta = evict_folios(lruvec, sc, swappiness);
+		/*
+			退出条件 2：如果 delta 为 0，表示这次 evict_folios 调用没有成功回收任何页面。这可能是因为：
+			所有找到的页面都被锁定了（mlock）或正在忙。
+			所有文件页都是脏的，并且回写设备很慢，无法立即回收。
+			没有可回收的页面了。
+			既然这次调用一无所获，继续循环很可能也是徒劳，所以跳出循环。
+		*/
 		if (!delta)
 			break;
 
+		/*
+			累计与退出条件 3：将本次回收的页面数 delta 累加到 scanned 中。
+			如果累计回收的页面数已经达到或超过了本次循环计划扫描的数量 (nr_to_scan)，则任务完成，跳出循环。
+		*/
 		scanned += delta;
 		if (scanned >= nr_to_scan)
 			break;
 
+		/*
+			退出条件 4：检查是否应该中止扫描。should_abort_scan 可能返回 true 的原因包括：
+			已经回收了足够的内存，满足了最初的请求。
+			回收线程的运行时间片已用完。
+			有更高优先级的任务需要运行。
+			这是保证回收行为不会过度影响系统响应性的重要检查。
+		*/
 		if (should_abort_scan(lruvec, sc))
 			break;
 
+		/*
+			主动调度：cond_resched() 是一个自愿让出 CPU 的提示。在长时间运行的循环中，它允许内核调度器有机会运行
+			其他任务，防止回收线程独占CPU，从而避免系统卡顿和无响应。
+		*/
 		cond_resched();
 	}
 
 	/*
-	 * If too many file cache in the coldest generation can't be evicted
-	 * due to being dirty, wake up the flusher.
+		处理脏页拥堵：这是一个非常重要的后处理步骤。
+		sc->nr.file_taken: 在扫描过程中遇到的文件页的数量。
+		sc->nr.unqueued_dirty: 其中，是脏的但还没有被加入到回写（writeback）队列的页面数量。
+		条件判断：如果发现所有遇到的脏文件页都没有被成功加入回写队列（unqueued_dirty == file_taken），说明脏页的回写流程可能遇到了瓶颈或停滞。
+		操作：此时，主动调用 wakeup_flusher_threads 来唤醒负责回写的内核线程（flusher threads），加速脏页的刷新，为后续的回收尝试创造条件。
 	 */
 	if (sc->nr.unqueued_dirty && sc->nr.unqueued_dirty == sc->nr.file_taken)
 		wakeup_flusher_threads(WB_REASON_VMSCAN);
 
-	/* whether this lruvec should be rotated */
+	/*
+		最终返回值：函数的返回值是 (nr_to_scan < 0)。
+		回想前面的 nr_to_scan = get_nr_to_scan(...)，这个函数在某些情况下会返回一个负值。这通常发生在系统内存压力非常小，
+		扫描器处于“节能”模式，或者该 lruvec 需要被跳过时。
+		因此，如果 nr_to_scan 是负数，函数返回 true，这是在向调用者 (shrink_one) 发送一个信号：“这个 lruvec 的回收工作
+		已经完成或应该被跳过，可以考虑调整它在队列中的位置了（例如，把它移到更年轻的代）。”
+		如果 nr_to_scan 是正数（说明是因为其他 break 条件退出，可能还有工作没做完），则返回 false，表示不需要调整。
+	*/
 	return nr_to_scan < 0;
 }
 
+/*
+	对给定的 lruvec（代表一个 memcg 在某个 NUMA 节点上的内存）执行一次内存回收扫描。
+	参数：
+		lruvec: 指向要回收的目标 LRU 向量的指针。
+		sc: 指向扫描控制结构的指针，包含了回收的上下文信息（如优先级、分配阶数等）。
+	返回值：返回一个 enum 值（如 MEMCG_LRU_YOUNG, MEMCG_LRU_TAIL），用于指示调用方应如何调整该 memcg 在回收队列中的位置。
+*/
 static int shrink_one(struct lruvec *lruvec, struct scan_control *sc)
 {
-	bool success;
+	bool success;					// 用于记录本次回收是否成功。
 	unsigned long scanned = sc->nr_scanned;
-	unsigned long reclaimed = sc->nr_reclaimed;
-	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
-	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+	unsigned long reclaimed = sc->nr_reclaimed;			// 保存扫描开始前的初始值。用于计算本次函数调用实际扫描和回收的页面数（本次增量 = 结束时值 - 开始时值）。
+	struct mem_cgroup *memcg = lruvec_memcg(lruvec);	// 从 lruvec 中获取其所属的内存控制组。
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec);	// 从 lruvec 中获取其所属的 NUMA 节点。
 
-	/* lru_gen_age_node() called mem_cgroup_calculate_protection() */
+	/*
+		最低保护检查：检查该 memcg 的内存使用是否低于其 memory.min 阈值。这是一个硬性保护线，表示该组的内存已达到生存所需的最低限度。
+		操作：如果低于 min，则立即返回 MEMCG_LRU_YOUNG，不再进行任何回收。这相当于告诉上层：“这个组的内存已经少到不能少了，别再回收它了，把它移到年轻代保护起来。”
+	*/
 	if (mem_cgroup_below_min(NULL, memcg))
 		return MEMCG_LRU_YOUNG;
 
+	/*
+		低水位保护检查：检查该 memcg 的内存使用是否低于其 memory.low 阈值。这是一个软性保护线，表示该组的内存使用已进入受保护范围，应尽量避免回收。
+		操作：
+		如果低于 low，并且它尚未被标记为 MEMCG_LRU_TAIL（即不在队列末尾），则返回 MEMCG_LRU_TAIL。意思是：“这个组受保护了，别急着回收它，先把它移到队列末尾，
+		让别人先顶上去。”
+		如果它已经在队列末尾了（seg == MEMCG_LRU_TAIL），则触发一个 MEMCG_LOW 事件（通知用户空间），然后继续执行后面的回收逻辑。因为如果所有组都在 low 以下，
+		系统总得回收一些内存，不能完全停止。
+	*/
 	if (mem_cgroup_below_low(NULL, memcg)) {
 		/* see the comment on MEMCG_NR_GENS */
 		if (READ_ONCE(lruvec->lrugen.seg) != MEMCG_LRU_TAIL)
@@ -4812,61 +5198,100 @@ static int shrink_one(struct lruvec *lruvec, struct scan_control *sc)
 		memcg_memory_event(memcg, MEMCG_LOW);
 	}
 
+	/*
+		核心回收操作：调用 try_to_shrink_lruvec 函数。这是真正执行页面回收的地方，它会扫描 lruvec 中的 LRU 列表，尝试回收（释放）一些页面。
+		结果：将返回值存入 success，表示是否成功回收到页面。
+	*/
 	success = try_to_shrink_lruvec(lruvec, sc);
 
+	// Slab 缓存回收：在回收了页面缓存之后，尝试回收该 memcg 相关的 Slab 缓存（如 dentry, inode 缓存等）。这是内存回收的另一重要组成部分。
 	shrink_slab(sc->gfp_mask, pgdat->node_id, memcg, sc->priority);
 
+	/*
+		内存压力通知：如果本次回收是直接回收（!sc->proactive，即由应用程序的分配请求同步触发，而非后台线程 kswapd），则计算本次调用中实际扫描
+		和回收的页面数（通过减掉之前保存的初始值得到增量），并通过 vmpressure 机制产生内存压力事件。这用于通知用户空间（如 Android LMKD）内存
+		压力状况，使其可以采取相应措施（如杀死进程）。
+	*/
 	if (!sc->proactive)
 		vmpressure(sc->gfp_mask, memcg, false, sc->nr_scanned - scanned,
 			   sc->nr_reclaimed - reclaimed);
 
+	// 刷新回收状态：将本次回收的统计信息（如 nr_reclaimed）更新到更全局的计数器中，确保其可见性。
 	flush_reclaim_state(sc);
 
+	/*
+		成功回收且在线：如果回收成功并且该 memcg 仍然在线（未被删除），则返回 MEMCG_LRU_YOUNG。意思是：“这次回收很顺利，
+		这个组里可能还有不少可回收的页面，但先让它休息一下，把它移到年轻代，下次再扫。”
+	*/
 	if (success && mem_cgroup_online(memcg))
 		return MEMCG_LRU_YOUNG;
 
+	/*
+		回收失败但规模大：如果回收没有成功****并且该 lruvec 的规模仍然很大（lruvec_is_sizable），则返回 0 (MEMCG_LRU_NOP)。
+		意思是：“这次没收回东西，但它明明还有很多页面，可能只是页面都比较活跃（热）。暂时不做任何调整，下次再试试看。”
+	*/
 	if (!success && lruvec_is_sizable(lruvec, sc))
 		return 0;
 
-	/* one retry if offlined or too small */
+	/*
+		最终默认策略：这是一个条件操作符，是函数的最终默认返回值。
+		如果该 lruvec 当前不是 MEMCG_LRU_TAIL 状态，则返回 MEMCG_LRU_TAIL。意思是：“这个组回收效果不理想，让它到队列末尾去排队，给别人让位。”
+		如果该 lruvec 当前已经是 MEMCG_LRU_TAIL 状态，则返回 MEMCG_LRU_YOUNG。意思是：“它都已经在末尾了还是回收不好，那或许它的页面都很重要，
+		先把它移到年轻代保护一下，减轻压力。”
+	*/
 	return READ_ONCE(lruvec->lrugen.seg) != MEMCG_LRU_TAIL ?
 	       MEMCG_LRU_TAIL : MEMCG_LRU_YOUNG;
 }
 
 static void shrink_many(struct pglist_data *pgdat, struct scan_control *sc)
 {
-	int op;
-	int gen;
-	int bin;
-	int first_bin;
-	struct lruvec *lruvec;
-	struct lru_gen_folio *lrugen;
-	struct mem_cgroup *memcg;
-	struct hlist_nulls_node *pos;
+	int op;					// 操作结果，用于记录对单个 memcg 回收操作的结果
+	int gen;				// 代(generation)编号，用于LRUGen算法
+	int bin;				// 当前处理的bin(桶)索引
+	int first_bin;			// 初始随机选择的bin索引
+	struct lruvec *lruvec;	// 指向LRU向量的指针
+	struct lru_gen_folio *lrugen;		// 指向LRUGen folio结构的指针
+	struct mem_cgroup *memcg;			// 指向当前处理的内存控制组的指针
+	struct hlist_nulls_node *pos;		// 用于遍历哈希链表的节点指针
 
+	// 获取当前要处理的代(generation)编号。READ_ONCE 确保安全地读取可能被并发修改的值。
 	gen = get_memcg_gen(READ_ONCE(pgdat->memcg_lru.seq));
+	// bin 是一个用于对 memcg 进行散列分组的索引。它通过将 memcg 分散到多个短链表中，
+	// 并结合随机起始点的扫描策略，极大地提升了内存回收的效率和公平性。
 	bin = first_bin = get_random_u32_below(MEMCG_NR_BINS);
 restart:
 	op = 0;
-	memcg = NULL;
+	memcg = NULL;			// 初始化操作结果和当前memcg指针。
 
-	rcu_read_lock();
+	rcu_read_lock();		// 进入RCU(Read-Copy-Update)读临界区，保护后续的链表遍历操作。
 
+	// 开始遍历指定代(gen)和指定bin的memcg链表。这是一个RCU安全的遍历宏。
+	// pgdat->memcg_lru.fifo[gen][bin] : 二维哈西表
 	hlist_nulls_for_each_entry_rcu(lrugen, pos, &pgdat->memcg_lru.fifo[gen][bin], list) {
+		// 如果前一个memcg的处理有操作结果(op不为0)，则执行相应的旋转操作，然后重置操作结果。
 		if (op) {
+			// 根据OP不同，执行不同的迁移动作：如果一个 memcg 很容易被回收（有很多冷内存），
+			// 在成功回收后就被移到队列后面，相当于给它"放假"，避免因其"好欺负"而被过度回收
+			// 如果一个 memcg 回收困难（内存都很活跃），就把它移到队列前面，持续关注它，
+			// 确保它不会因为难以回收就永远躲在队列后面，从而逃避其应承担的内存回收责任
 			lru_gen_rotate_memcg(lruvec, op);
 			op = 0;
 		}
 
+		// 释放前一个memcg的引用计数，并清空指针。
 		mem_cgroup_put(memcg);
 		memcg = NULL;
 
+		// 检查当前lrugen的代是否与我们要处理的代一致，如果不一致则跳过（可能已被并发修改）。
 		if (gen != READ_ONCE(lrugen->gen))
 			continue;
 
+		// 通过lrugen指针获取包含它的lruvec结构。
 		lruvec = container_of(lrugen, struct lruvec, lrugen);
+		// 从lruvec获取对应的memcg。
 		memcg = lruvec_memcg(lruvec);
 
+		// 尝试获取memcg的引用计数，如果失败则释放相关资源并跳过这个memcg。
 		if (!mem_cgroup_tryget(memcg)) {
 			lru_gen_release_memcg(memcg);
 			memcg = NULL;
@@ -4875,29 +5300,39 @@ restart:
 
 		rcu_read_unlock();
 
+		// 暂时退出RCU读临界区，因为接下来的操作可能阻塞。
 		op = shrink_one(lruvec, sc);
 
-		rcu_read_lock();
+		rcu_read_lock();	// 重新进入RCU读临界区，继续遍历。
 
+		// 检查是否应该中止扫描（例如已回收足够内存），如果是则跳出循环。
 		if (should_abort_scan(lruvec, sc))
 			break;
 	}
 
-	rcu_read_unlock();
+	// 退出RCU读临界区。
+	rcu_read_unlock(); //  结束memcg链表的遍历循环。
 
+	// 如果最后一个memcg有操作结果，执行相应的旋转操作。
 	if (op)
 		lru_gen_rotate_memcg(lruvec, op);
 
+	// 释放最后一个memcg的引用计数。
 	mem_cgroup_put(memcg);
 
+	// 如果遍历没有到达链表末尾（即没有遍历完所有memcg），直接返回。
+	// 没有遍历完有如下可能性：优先级提升：有更重要的进程需要CPU，当前回收线程需要让路。
+	// 已回收足够页面：本次回收操作已经成功释放了足够多的内存，满足了请求，无需继续。
+	// 时间片用尽：回收线程已经运行了足够长的时间，需要退出以避免占用过多CPU。
+	// 其他信号或事件：例如，整个节点（NUMA node）的内存压力已经解除。
 	if (!is_a_nulls(pos))
 		return;
 
-	/* restart if raced with lru_gen_rotate_memcg() */
+	// 检查是否与 lru_gen_rotate_memcg() 并发操作产生了竞争条件，如果是则重新开始。
 	if (gen != get_nulls_value(pos))
 		goto restart;
 
-	/* try the rest of the bins of the current generation */
+	// 尝试处理当前代的其他bin，如果还有未处理的bin，则重新开始。
 	bin = get_memcg_bin(bin + 1);
 	if (bin != first_bin)
 		goto restart;
@@ -4926,43 +5361,60 @@ static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc
 
 static void lru_gen_shrink_node(struct pglist_data *pgdat, struct scan_control *sc)
 {
+	// 声明一个块设备插桩结构，用于优化I/O调度
 	struct blk_plug plug;
+	// 保存进入函数时已经回收的页面数量，用于后续比较
 	unsigned long reclaimed = sc->nr_reclaimed;
 
+	// 内核警告：确保本次回收是针对系统全局的（根memcg），而不是某个特定cgroup
 	VM_WARN_ON_ONCE(!root_reclaim(sc));
 
 	/*
-	 * Unmapped clean folios are already prioritized. Scanning for more of
-	 * them is likely futile and can cause high reclaim latency when there
-	 * is a large number of memcgs.
-	 */
+     * 注释解释：未映射的干净folio已经被优先处理了。继续扫描它们可能徒劳无功，
+     * 并且在存在大量memcg时可能导致很高的回收延迟。
+     */
+    // 如果本次回收不允许回写页面或取消映射，则跳过主要逻辑
 	if (!sc->may_writepage || !sc->may_unmap)
-		goto done;
+		goto done; // 直接跳转到最后的done标签
 
+	// 将per-CPU LRU缓存中的页面排空（drain）到相应的zone/LRU列表中，确保我们扫描的是最新状态
 	lru_add_drain();
 
+	// 将一段时间内产生的多个分散的、小的I/O请求合并（打包） 成更少、更大的I/O请求后再提交给磁盘驱动器，从而显著减少磁盘寻道次数，提升I/O吞吐量
 	blk_start_plug(&plug);
 
+	// 为当前执行内存回收任务的线程（通常是 kswapd 内核线程或执行直接回收的进程）准备一个 mm_walk 结构体
 	set_mm_walk(pgdat, sc->proactive);
 
+	// 根据当前内存压力、优先级等设置初始扫描优先级和控制参数
 	set_initial_priority(pgdat, sc);
 
+	// 如果当前进程是kswapd，则将回收计数重置为0。
+    // 这是因为kswapd可能会多次调用此函数，我们想单独计算本次调用的回收量
 	if (current_is_kswapd())
 		sc->nr_reclaimed = 0;
 
+	// 检查内存控制组(memcg)功能是否被禁用
 	if (mem_cgroup_disabled())
+		// 如果禁用，则只有一个全局的lruvec（在pgdat中），直接收缩它
 		shrink_one(&pgdat->__lruvec, sc);
 	else
+		// 如果启用，则需要遍历所有memcg，并收缩每个memcg在该节点上的lruvec
 		shrink_many(pgdat, sc);
 
+	// 如果当前进程是kswapd，把本次函数调用回收的页面数加回到总计数中
 	if (current_is_kswapd())
 		sc->nr_reclaimed += reclaimed;
 
+	// 清除之前设置的内存遍历(mm_walk)状态
 	clear_mm_walk();
 
+	// 结束块设备插桩，提交合并的I/O请求
 	blk_finish_plug(&plug);
 done:
+	// 判断：如果在本函数执行过程中回收了页面（即最终计数大于初始计数）
 	if (sc->nr_reclaimed > reclaimed)
+		// 则重置该节点的kswapd失败次数计数器。表明回收有进展，情况在改善
 		pgdat->kswapd_failures = 0;
 }
 
@@ -5967,6 +6419,7 @@ again:
 	nr_reclaimed = sc->nr_reclaimed;
 	nr_scanned = sc->nr_scanned;
 
+	// 多代内存管理，直接返回
 	prepare_scan_control(pgdat, sc);
 
 	// 分层扫描内存cgroup
@@ -6645,73 +7098,77 @@ static bool pgdat_watermark_boosted(pg_data_t *pgdat, int highest_zoneidx)
 	return false;
 }
 
-/*
- * Returns true if there is an eligible zone balanced for the request order
- * and highest_zoneidx
- */
+// 检查给定的NUMA节点 pgdat 是否在指定 order (分配阶数) 和 highest_zoneidx (允许分配的最高内存区域索引) 的限制下，
+// 拥有至少一个“合格”且“平衡”的内存区域（zone）。
+// pgdat： 指向要检查的NUMA节点数据的指针。
+// order： 伙伴分配器中的分配阶数。例如，order=0 申请一页(4KB)，order=3 申请8页(32KB)。它代表了连续物理页的需求。
+// highest_zoneidx： 调用方允许从哪个区域索引及以下的区域进行分配。例如，如果调用只能从 ZONE_NORMAL 及以下分配，这个值就是 ZONE_NORMAL 的索引。
+// 返回值： true 如果至少找到一个符合条件的zone，否则 false。
 static bool pgdat_balanced(pg_data_t *pgdat, int order, int highest_zoneidx)
 {
 	int i;
-	unsigned long mark = -1;
+	unsigned long mark = -1; // 初始化标记为-1，这是一个特殊值
 	struct zone *zone;
 
-	/*
-	 * Check watermarks bottom-up as lower zones are more likely to
-	 * meet watermarks.
-	 */
+	// 开始一个宏循环：遍历NUMA节点 pgdat 中，索引从0到 highest_zoneidx 的所有被有效管理的内存区域（zone）。
+	// 例如，如果 highest_zoneidx 是 ZONE_NORMAL，它就不会遍历 ZONE_HIGHMEM。
 	for_each_managed_zone_pgdat(zone, pgdat, i, highest_zoneidx) {
 		enum zone_stat_item item;
 		unsigned long free_pages;
 
 		if (sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING)
+			// 如果系统配置了基于内存分层（Memory Tiering） 的NUMA平衡策略，则使用 promo_wmark_pages(zone) 作为标记。
+			// 这个水位线通常比普通的高水位线更低，目的是为了促进（promote）页面在NUMA节点间迁移，即使空闲内存不多，也尝试平衡。
 			mark = promo_wmark_pages(zone);
 		else
+			// 否则，使用标准的高水位线（high watermark） high_wmark_pages(zone)。这是zone的空闲页数需要超过的一个标准阈值，
+			// 以达到“平衡”状态。如果一个zone的空闲页高于高水位线，说明它很充裕。
 			mark = high_wmark_pages(zone);
 
-		/*
-		 * In defrag_mode, watermarks must be met in whole
-		 * blocks to avoid polluting allocator fallbacks.
-		 *
-		 * However, kswapd usually cannot accomplish this on
-		 * its own and needs kcompactd support. Once it's
-		 * reclaimed a compaction gap, and kswapd_shrink_node
-		 * has dropped order, simply ensure there are enough
-		 * base pages for compaction, wake kcompactd & sleep.
-		 */
 		if (defrag_mode && order)
+			// 如果调用方开启了碎片整理模式（defrag_mode）并且申请的是高阶内存（order > 0），则使用 NR_FREE_PAGES_BLOCKS。
+			// 这个统计项计算的是足够大、能够满足当前 order 需求的连续空闲页块的数量。这避免了碎片化严重时，总空闲页多但都是零散小页，无法满足大块分配请求的情况。
 			item = NR_FREE_PAGES_BLOCKS;
 		else
+			// 否则，使用最常规的 NR_FREE_PAGES，即zone中所有空闲页的总和。
 			item = NR_FREE_PAGES;
 
-		/*
-		 * When there is a high number of CPUs in the system,
-		 * the cumulative error from the vmstat per-cpu cache
-		 * can blur the line between the watermarks. In that
-		 * case, be safe and get an accurate snapshot.
-		 *
-		 * TODO: NR_FREE_PAGES_BLOCKS moves in steps of
-		 * pageblock_nr_pages, while the vmstat pcp threshold
-		 * is limited to 125. On many configurations that
-		 * counter won't actually be per-cpu cached. But keep
-		 * things simple for now; revisit when somebody cares.
-		 */
+		// 从zone的统计信息中，获取上一步选择的统计项（item）的当前值，存入 free_pages。
 		free_pages = zone_page_state(zone, item);
+		/*
+			处理CPU计数器的漂移（Drift）：这是一个优化和容错处理。
+			每个CPU都有本地的内存统计计数器，定期同步到zone的总计中。zone_page_state 读取的是总计，可能略有滞后。
+			percpu_drift_mark 是一个阈值，如果计算出的 free_pages 低于这个值，说明空闲页已经非常紧张。
+			在这种情况下，为了避免因为计数器不同步而误判，函数会使用 zone_page_state_snapshot。这个函数代价更高，
+			它会精确地汇总所有CPU的本地计数器，得到一个最新、最准确的空闲页数量。
+		*/
 		if (zone->percpu_drift_mark && free_pages < zone->percpu_drift_mark)
 			free_pages = zone_page_state_snapshot(zone, item);
 
+		/*
+			核心检查：调用 __zone_watermark_ok 函数，使用前面计算出的参数，检查当前zone是否满足水位要求。
+			zone: 要检查的zone。
+			order: 需求的分配阶。
+			mark: 要超过的水位线（high_wmark 或 promo_wmark）。
+			highest_zoneidx: 允许的最高区域。
+			0: 这是一个保留的访问标志，通常为0。
+			free_pages: 用于比较的空闲页数（可能是总计也可能是快照）。
+			如果这个zone通过了检查（即空闲页足够），函数立即返回 true，表示找到了一个平衡的zone。
+		*/
 		if (__zone_watermark_ok(zone, order, mark, highest_zoneidx,
 					0, free_pages))
 			return true;
 	}
 
 	/*
-	 * If a node has no managed zone within highest_zoneidx, it does not
-	 * need balancing by definition. This can happen if a zone-restricted
-	 * allocation tries to wake a remote kswapd.
-	 */
+		处理循环未执行的情况：如果 mark 还是初始值 -1，说明上面的 for 循环一次都没有执行。
+		循环未执行的原因通常是：highest_zoneidx 参数可能是一个无效的索引（比如小于0），或者该NUMA节点在请求的索引范围内没有任何被管理的zone。
+		在这种情况下，函数认为没有zone需要检查，因此默认返回 true（“平衡”），这是一种安全退出的策略。
+	*/
 	if (mark == -1)
 		return true;
 
+	// 如果循环执行了（mark 不是 -1）但没有找到任何一个合格的zone，则返回 false，表示这个NUMA节点在要求的条件下不平衡，内存回收器或分配器需要采取行动。
 	return false;
 }
 
@@ -6788,13 +7245,9 @@ static bool kswapd_shrink_node(pg_data_t *pgdat,
 	// 核心回收执行
 	shrink_node(pgdat, sc);
 
-	// 防过度回收机制：
-	// 1. 仅当处理高阶分配时生效（sc->order > 0）
-	// 2. compact_gap()：计算阈值（通常为 2 * (2^order) 页）
-	// 3. 核心逻辑：若回收页数超过碎片阈值
-	//        说明碎片是主要问题而非总内存量
-	//        降阶为 order-0 回收（避免继续无效回收）
-	//        相当于说："回收了双倍所需内存仍无法满足，换策略！"
+	// 当进行高阶内存分配（order>0）的回收时，如果实际回收页数已经达到该order对应的压缩间隙阈值，就主动降级回收目标（将order设为0）。
+	// 高阶分配需要大量连续内存，回收压力大。如果已经回收了“足够多”的页（通过compact_gap计算），可能已经满足了原始需求或触发了其他
+	// 机制（如压缩），这时继续坚持高阶回收可能效率低下，不如降级为普通单页回收更高效。
 	if (sc->order && sc->nr_reclaimed >= compact_gap(sc->order))
 		sc->order = 0;
 
@@ -6846,13 +7299,13 @@ clear_reclaim_active(pg_data_t *pgdat, int highest_zoneidx)
  * balanced.
  */
 /*
-对于 kswapd，balance_pgdat() 将从调用者可用的区域中回收节点内的页面，直到至少一个可用区域达到平衡。
+	对于 kswapd，balance_pgdat() 将从调用者可用的区域中回收节点内的页面，直到至少一个可用区域达到平衡。
 
-返回 kswapd 完成回收的顺序。
+	返回 kswapd 完成回收的顺序。
 
-kswapd 会按 highmem->normal->dma 方向扫描区域。它会跳过 free_pages > high_wmark_pages(zone) 的
-区域，但一旦发现某个区域的 free_pages <= high_wmark_pages(zone)，则该区域或更低区域内的任何页面
-都有资格回收，直到至少一个可用区域达到平衡。
+	kswapd 会按 highmem->normal->dma 方向扫描区域。它会跳过 free_pages > high_wmark_pages(zone) 的
+	区域，但一旦发现某个区域的 free_pages <= high_wmark_pages(zone)，则该区域或更低区域内的任何页面
+	都有资格回收，直到至少一个可用区域达到平衡。
 */
 // pgdat：指向要平衡的内存节点的指针。
 // order：要求回收的页面数量（2的order次方个页面）。
@@ -6874,6 +7327,14 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
 	};
 
 	set_task_reclaim_state(current, &sc.reclaim_state); 	// 设置当前任务的回收状态
+	/*
+		典型调用位置
+		1. 直接内存回收路径（最核心场景）:内核在直接内存回收（Direct Reclaim） 期间调用，当进程因内存不足被迫等待回收完成时
+		2. 内存压缩路径:在内存碎片整理（Compaction） 中，当进程因碎片问题需要迁移页面时
+		3. 页面错误处理路径:进程触发页面错误（Page Fault） 且需要等待内存分配时
+		4. 内存分配慢路径:当进程通过 __alloc_pages_slowpath() 分配内存时陷入等待
+		5. cgroup 内存限制:当 cgroup 达到内存限制阈值时，触发进程阻塞
+	*/
 	psi_memstall_enter(&pflags);                        	// 进入内存停滞状态，用于PSI统计
 	__fs_reclaim_acquire(_THIS_IP_);                     	// 禁止文件系统回收（防止递归死锁）
 
@@ -6883,6 +7344,11 @@ static int balance_pgdat(pg_data_t *pgdat, int order, int highest_zoneidx)
 	// watermark_boost：每个zone有一个boost值，当分配失败时可能会提高水位线（watermark）以触发
 	// kswapd更积极地回收。这里记录下当前的boost值，以便在回收完成后降低boost。
 	for_each_managed_zone_pgdat(zone, pgdat, i, highest_zoneidx) {
+		/*
+			zone->watermark_boost 是 Linux 内核在每个内存区（zone）里维护的一个“动态加成值”（单位：页），用来临时抬高该 zone 的水位线（min/low/high）。
+			它的目的，是在系统经历过高阶（order>0）页分配压力时，预留出更多空闲页，让 kswapd 更积极地回收，提前为将来的高阶分配准备连续空闲内存，
+			降低分配卡顿和失败概率。
+		*/
 		nr_boost_reclaim += zone->watermark_boost;   	// 累加所有zone的watermark_boost
 		zone_boosts[i] = zone->watermark_boost;       	// 记录每个zone的boost值
 	}
@@ -6900,14 +7366,27 @@ restart:
 
 		sc.reclaim_idx = highest_zoneidx;           	// 设置扫描控制中的回收索引为最高zone索引
 
-		// 当系统中有过多的buffer_heads（通常发生在32位系统上，高端内存映射占用低端内存）时，需要回收所有zone（包括高zone）来释放buffer_heads。
+		// 当系统因管理海量磁盘缓存映射（buffer_head）而面临性能瓶颈时，此代码会强制内存回收器改变策略，
+		// 优先甚至专门从高端内存区域（ZONE_HIGHMEM）开始回收内存，因为那里是问题的根源所在。
+		// 问题根源：buffer_heads_over_limit 为真，意味着内核花费了太多资源在管理 buffer_head 结构体上，而不是文件数据本身。这是一个性能瓶颈信号。
+		// ZONE_HIGHMEM（高端内存区） 传统上专门用于存放用户进程的数据和文件的页缓存（Page Cache）。而文件的页缓存，正是绝大多数 buffer_head 所映射和管理的对象。
 		if (buffer_heads_over_limit) {
+			// 如果超过，则进入紧急处理模式。
+			// 初始化一个循环，从最高索引的内存区域向最低索引遍历。
+			// MAX_NR_ZONES - 1 通常是 ZONE_HIGHMEM 或 ZONE_MOVABLE 的索引。
 			for (i = MAX_NR_ZONES - 1; i >= 0; i--) {
+				// 获取当前遍历到的内存区域（zone）的指针。
+        		// 例如：i=2 对应 ZONE_HIGHMEM, i=1 对应 ZONE_NORMAL, i=0 对应 ZONE_DMA。
 				zone = pgdat->node_zones + i;
+				// 检查该区域是否被内核有效管理（例如，是否存在且有页面）。
+        		// 如果不是，则跳过此区域，继续检查下一个（更低）的区域。
 				if (!managed_zone(zone))
 					continue;
 
-				sc.reclaim_idx = i;   // 强制回收所有zone，包括高zone（通常是高端内存）
+				// 如果找到一个被有效管理的内存区域，立即将内存回收器（sc）的
+        		// 回收索引（reclaim_idx）设置为当前区域的索引（i）。
+				sc.reclaim_idx = i;
+				// 然后立刻跳出循环。因为我们只需要找到第一个（即最高地址的）有效区域。
 				break;
 			}
 		}
@@ -6939,6 +7418,7 @@ restart:
 		// 软限制回收
 		sc.nr_scanned = 0;   // 重置扫描计数
 		nr_soft_scanned = 0;
+		// 如果启用了MGlru，则始终返回0，多代lru不支持软限制回收
 		nr_soft_reclaimed = memcg1_soft_limit_reclaim(pgdat, sc.order,
 							      sc.gfp_mask, &nr_soft_scanned);
 		sc.nr_reclaimed += nr_soft_reclaimed;  // 累加软限制回收的页面数
@@ -6950,15 +7430,19 @@ restart:
 		if (kswapd_shrink_node(pgdat, &sc)) // 执行实际的回收工作
 			raise_priority = false;    // 如果回收足够有效，则不需要提高优先级
 
-		// 当节点满足低水线时，允许直接回收（由进程自身执行回收），因此唤醒等待的进程
-		// （通常是网络进程，因pfmemalloc而阻塞）。
+		// 1. 检查：是否有至关重要的内核线程因为等不到保留内存而在等待队列里睡着了？
 		if (waitqueue_active(&pgdat->pfmemalloc_wait) &&
+				// 2. 检查：当前内存节点的状态是否允许进行直接回收？ (例如，检查水位线，确保唤醒它们后，回收操作有成功的机会)
 				allow_direct_reclaim(pgdat))
+			// 3. 如果两个条件都满足，就唤醒所有在这个队列上睡眠的线程
 			wake_up_all(&pgdat->pfmemalloc_wait); // 如果允许直接回收，唤醒等待的进程
 
 		// 检查是否应该停止（冻结或终止）
 		__fs_reclaim_release(_THIS_IP_);  // 临时释放FS回收锁，允许进行冻结操作
-		ret = kthread_freezable_should_stop(&was_frozen); // 检查线程是否被冻结或需要停止
+		// 检查当前内核线程是否应该停止运行，或者是否曾被冻结过。kswapd 需要定期检查两个信号：
+		// kthread_should_stop()：是否有人（例如，内核模块卸载或系统关闭）要求此线程退出。
+		// freezing(current)：系统是否正在进行休眠（hibernation/suspend）并要求冻结（freeze）所有内核线程。
+		ret = kthread_freezable_should_stop(&was_frozen);
 		__fs_reclaim_acquire(_THIS_IP_);   // 重新获取FS回收锁
 		if (was_frozen || ret)           // 如果被冻结或需要停止，则跳出循环
 			break;
@@ -6980,7 +7464,7 @@ restart:
 	// 并且是因为cache_trim_mode失败，则重试一次（关闭cache_trim_mode）
 	if (!sc.nr_reclaimed && sc.priority < 1 &&
 	    !sc.no_cache_trim_mode && sc.cache_trim_mode_failed) {
-		sc.no_cache_trim_mode = 1;  // 标记不再尝试cache_trim_mode
+		sc.no_cache_trim_mode = 1;  // 本次回收的目标非常明确和紧急，请专注于回收最核心的内存（页面缓存和匿名页），不要分心去尝试释放那些VFS缓存，即使它们也占用了内存。
 		goto restart;
 	}
 
@@ -7129,16 +7613,42 @@ static int kswapd(void *p)
 	pg_data_t *pgdat = (pg_data_t *)p;
 	struct task_struct *tsk = current;
 
-	// 赋予 特权内存分配权限，允许在内存紧张时直接分配页面（突破水位线限制），避免递归回收死锁。
+	// PF_MEMALLOC ： 赋予 特权内存分配权限，允许在内存紧张时直接分配页面（突破水位线限制），避免递归回收死锁。
+	// PF_KSWAPD   ： 标记为 kswapd 线程，便于调试和统计。
 	tsk->flags |= PF_MEMALLOC | PF_KSWAPD;
-	// 允许内核冻结机制在系统挂起时暂停该线程。
+	// 允许内核冻结机制在系统挂起时暂停该线程，并在状态设置完成后，自动尝试一次freeze。
 	set_freezable();
 
-	// 初始化回收请求阶数为 0（无高阶分配需求）。
+	// 此处刚开始初始化kswapd，因此认为之前设置的分配阶数均无效，该阶数表达其他线程请求的需要连续分配的页面的阶数。
 	WRITE_ONCE(pgdat->kswapd_order, 0);
-	// 取消内存区域优先级限制。
+	// 取消内存区域优先级限制，该参数用于指导kswapd线程在哪些内存区域范围内执行回收，如下列区域，重要特性：区域类型值越小，表示在内存架构中位置越低。
+	/*
+	enum zone_type {
+    ZONE_DMA,       // 0: 直接内存访问区 (0-16MB)
+    ZONE_DMA32,     // 1: 32位DMA区 (<4GB)
+    ZONE_NORMAL,    // 2: 普通映射区 (直接映射)
+    ZONE_HIGHMEM,   // 3: 高端内存 (32位系统)
+    ZONE_MOVABLE,   // 4: 可移动区域
+    __MAX_NR_ZONES  // 5: 区域总数
+	};
+	*/
+	// 只回收 <= kswapd_highest_zoneidx 的区域，节点恢复平衡后，重置为 MAX_NR_ZONES（表示不限制区域类型）。
 	WRITE_ONCE(pgdat->kswapd_highest_zoneidx, MAX_NR_ZONES);
 	// 重置 I/O 节流计数器，准备准确跟踪脏页写回状态。
+	/*
+	节流登记划分：
+		正常 0-10% 最大脏页数		无节流
+		轻度 10-30% 最大脏页数		延迟提价
+		中度 30-60% 最大脏页数		减少并发
+		严重 60-100% 最大脏页数		停止提交
+
+	节流效果矩阵：
+		节流等级	回写提交延迟	  最大并发IO	 内存回收强度
+		正常		无延迟			 无限制			低
+		轻度		100ms			 减少25%		中
+		中度		500ms			 减少50%		高
+		严重		1s+				 停止提交		紧急回收
+	*/
 	atomic_set(&pgdat->nr_writeback_throttled, 0);
 	for ( ; ; ) {
 		bool was_frozen;
